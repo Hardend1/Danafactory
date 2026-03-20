@@ -1,0 +1,2030 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>نظام إدارة المصنع</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Cairo','Tajawal',sans-serif;background:#f1f5f9;direction:rtl}
+#loading{display:flex;align-items:center;justify-content:center;height:100vh;font-size:18px;color:#1e40af;font-family:Cairo,sans-serif}
+</style>
+</head>
+<body>
+<div id="root"><div id="loading">⏳ جاري التحميل...</div></div>
+<script data-type="module" type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+const mkSet  = (...args) => new Set(...args);
+const mkDate = (...args) => args.length ? new Date(...args) : new Date();
+const STAGES = ["تصميم","شراء المواد","حدادة","معجون","سنفرة","أساس","صبغ","تركيب","فنش"];
+const ICONS  = ["✏️","🛒","🔩","🪣","🔧","🏗️","🎨","🔨","✅"];
+const PROFS  = ["حداد","نجار","دهان","معجونجي","سنفرة","مركّب","مصمم","مشتريات","عامل عام","أخرى"];
+const ROLES  = {
+  admin:   {label:"مدير عام",     color:"#7e22ce", bg:"#f3e8ff", icon:"👑"},
+  factory: {label:"مدير مصنع",    color:"#1e40af", bg:"#dbeafe", icon:"🏭"},
+  sales:   {label:"مسؤول مبيعات", color:"#15803d", bg:"#dcfce7", icon:"📊"},
+  account: {label:"محاسب",        color:"#a16207", bg:"#fef9c3", icon:"💰"},
+};
+const CAN = {
+  viewProjects:  ["admin","factory","sales","account"],
+  addProject:    ["admin","factory","sales","account"],
+  editProject:   ["admin","factory","sales","account"],
+  editDelivery:  ["admin"],
+  deleteProject: ["admin"],
+  advanceStage:  ["admin","factory"],
+  logAttendance: ["admin","factory"],
+  logAbsence:    ["admin","factory"],
+  viewWorkers:   ["admin"],
+  viewCosts:     ["admin","account"],
+  exportExcel:   ["admin","account"],
+  viewReports:   ["admin","account"],
+  viewSettings:  ["admin"],
+};
+const can = (role, act) => (CAN[act]||[]).includes(role);
+const PS = {نشط:{bg:"#dcfce7",text:"#15803d",border:"#86efac"},متوقف:{bg:"#fef9c3",text:"#a16207",border:"#fde047"},مكتمل:{bg:"#dbeafe",text:"#1d4ed8",border:"#93c5fd"}};
+const PC = {عالي:"#ef4444",متوسط:"#f97316",منخفض:"#94a3b8"};
+const WS = {نشط:{bg:"#dcfce7",text:"#15803d",border:"#86efac"},إجازة:{bg:"#fef9c3",text:"#a16207",border:"#fde047"}};
+const today  = () => mkDate().toISOString().split("T")[0];
+const isFri  = d  => mkDate(d).getDay() === 5;
+const wage   = m  => m / 26;
+const fmtKWD = n  => Number(n).toLocaleString("ar-KW",{minimumFractionDigits:3,maximumFractionDigits:3});
+function addWD(dateStr, days) {
+  let d = mkDate(dateStr), a = 0;
+  while (a < days) { d.setDate(d.getDate()+1); if (d.getDay()!==5) a++; }
+  return d.toISOString().split("T")[0];
+}
+function countWD(s, e) {
+  let d = mkDate(s), c = 0, en = mkDate(e);
+  while (d < en) { if (d.getDay()!==5) c++; d.setDate(d.getDate()+1); }
+  return Math.max(0, c);
+}
+function daysLeft(dd) { return dd ? countWD(today(), dd) : 999; }
+function overall(p)   { return Math.round(((p.completedStages||[]).length / STAGES.length)*100); }
+function stageSched(startDate, deliveryDays) {
+  const n = STAGES.length, per = Math.floor(deliveryDays/n), rem = deliveryDays%n;
+  let cur = startDate;
+  return STAGES.map((name,i) => {
+    const days = Math.max(1, per + (i < rem ? 1 : 0));
+    const start = cur, end = addWD(cur, days);
+    cur = end;
+    return {name, icon:ICONS[i], days, startDate:start, endDate:end};
+  });
+}
+function schedWithOv(startDate, deliveryDays, ov={}) {
+  const n = STAGES.length, per = Math.floor(deliveryDays/n), rem = deliveryDays%n;
+  let cur = startDate;
+  return STAGES.map((name,i) => {
+    const days = ov[i] !== undefined ? ov[i] : Math.max(1, per + (i<rem?1:0));
+    const start = cur, end = addWD(cur, days);
+    cur = end;
+    return {name, icon:ICONS[i], days, startDate:start, endDate:end};
+  });
+}
+function stageDelay(endDate, isDone) {
+  if (isDone || !endDate) return 0;
+  const now = mkDate(), e = mkDate(endDate);
+  if (now <= e) return 0;
+  return Math.min(100, countWD(endDate, today())*10);
+}
+function applyCarryover(project, idx) {
+  const sched = schedWithOv(project.startDate, project.deliveryDays||30, project.stageOverrides||{});
+  const stg   = sched[idx];
+  const actual = Math.max(1, countWD(stg.startDate, today()));
+  const saved  = Math.max(0, stg.days - actual);
+  const newOv  = {...(project.stageOverrides||{}), [idx]: actual};
+  if (saved > 0) {
+    const future = sched.map((_,i)=>i).filter(i => i>idx && newOv[i]===undefined);
+    if (future.length > 0) {
+      const ex = Math.floor(saved/future.length), er = saved%future.length;
+      future.forEach((si,j) => { newOv[si] = sched[si].days + ex + (j<er?1:0); });
+    }
+  }
+  return {newOv, saved};
+}
+function splitCount(workerId, date, logs) {
+  const uniqueProjects = mkSet(
+    logs
+      .filter(l => l.date===date && l.workers.some(w => w.workerId===workerId))
+      .map(l => l.projectId)
+  );
+  return Math.max(1, uniqueProjects.size);
+}
+function projCosts(pid, logs) {
+  const pl = (logs||[]).filter(l => l.projectId===pid);
+  const counted = mkSet();
+  let total = 0;
+  pl.forEach(log => {
+    log.workers.forEach(w => {
+      const key = w.workerId + "_" + log.date;
+      if (counted.has(key)) return;
+      counted.add(key);
+      const sc = splitCount(w.workerId, log.date, logs);
+      total += (w.dailyWage * (log.isFriday?1.5:1)) / sc;
+    });
+  });
+  const workerDays = mkSet();
+  pl.forEach(log => log.workers.forEach(w => workerDays.add(w.workerId+"_"+log.date)));
+  return {total, wDays:workerDays.size,
+    unique:[...mkSet(pl.flatMap(l=>l.workers.map(w=>w.workerId)))].length,
+    logs:[...pl].sort((a,b)=>b.date.localeCompare(a.date))};
+}
+function stageWorkers(stageIdx, project, logs) {
+  const pl = (logs||[]).filter(l => l.projectId===project.id && l.stageIdx===stageIdx);
+  const counted = mkSet();
+  const map = {};
+  pl.forEach(log => {
+    log.workers.forEach(w => {
+      const key = w.workerId + "_" + log.date;
+      if (!map[w.workerId]) map[w.workerId] = {name:w.workerName, prof:w.profession||"—", days:0, cost:0, shared:false};
+      if (!counted.has(key)) {
+        counted.add(key);
+        const sc = splitCount(w.workerId, log.date, logs);
+        map[w.workerId].days += 1;
+        map[w.workerId].cost += (w.dailyWage*(log.isFriday?1.5:1))/sc;
+        if (sc > 1) map[w.workerId].shared = true;
+      }
+    });
+  });
+  return Object.values(map);
+}
+function exportCSV(project, logs, currency) {
+  const c = projCosts(project.id, logs);
+  const rows = [
+    [`مشروع: #${project.number} — ${project.name||project.region}`],
+    ["المنطقة:", project.region, "العميل:", project.client||"—"],
+    ["مسؤول المبيعات:", project.salesRep||"—", "تاريخ التسليم:", project.deliveryDate||"—"],
+    [`إجمالي التكلفة: ${fmtKWD(c.total)} ${currency}`],
+    [],
+    ["التاريخ","المرحلة","أسماء العمال","عدد العمال",`التكلفة (${currency})`],
+  ];
+  c.logs.forEach(log => {
+    let dayCost = 0;
+    log.workers.forEach(w => {
+      const sc = splitCount(w.workerId, log.date, logs);
+      dayCost += (w.dailyWage*(log.isFriday?1.5:1))/sc;
+    });
+    rows.push([
+      log.date+(log.isFriday?" (جمعة)":""),
+      log.stageIdx!==undefined ? STAGES[log.stageIdx] : "—",
+      log.workers.map(w=>w.workerName).join(" / "),
+      log.workers.length,
+      fmtKWD(dayCost),
+    ]);
+  });
+  rows.push([], ["","","","الإجمالي:", fmtKWD(c.total)+" "+currency]);
+  const BOM = "\uFEFF";
+  const csv = BOM + rows.map(r => r.map(cell => `"${String(cell||"").replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob = mkBlob([csv], {type:"text/csv;charset=utf-8;"});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = `مشروع_${project.number}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
+const DEF_USERS = [
+  {id:"u1",username:"admin",   password:"admin123",   role:"admin",   name:"المدير العام"},
+  {id:"u2",username:"factory", password:"factory123", role:"factory", name:"مدير المصنع"},
+  {id:"u3",username:"sales",   password:"sales123",   role:"sales",   name:"مسؤول المبيعات"},
+  {id:"u4",username:"account", password:"acc123",     role:"account", name:"المحاسب"},
+];
+const DEF_WORKERS = [
+  {id:"w1",name:"أحمد العلي",  salary:200,prof:"حداد",status:"نشط"},
+  {id:"w2",name:"محمد الرشيد", salary:180,prof:"دهان",status:"نشط"},
+  {id:"w3",name:"خالد النجار", salary:220,prof:"نجار",status:"نشط"},
+];
+const DEF_SETTINGS = {name:"مصنع الجودة",emoji:"🏭",logo:null,color:"#1e40af",cur:"د.ك"};
+const INP  = {width:"100%",padding:"10px 12px",border:"1.5px solid #e2e8f0",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none",background:"#f8fafc",boxSizing:"border-box"};
+const LBL  = {fontSize:12,color:"#64748b",fontWeight:700,display:"block",marginBottom:4};
+const CARD = {background:"white",borderRadius:16,boxShadow:"0 1px 8px rgba(0,0,0,.06)",border:"1px solid #f1f5f9"};
+function Ring({value, size=56, stroke=5, color="#1e40af"}) {
+  const r=(size-stroke)/2, c=2*Math.PI*r, off=c-(value/100)*c;
+  return (
+ <svg width={size} height={size} style={{flexShrink:0}}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#e2e8f0" strokeWidth={stroke}/>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={stroke}
+        strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round"
+ transform={`rotate(-90 ${size/2} ${size/2})`} style={{transition:"stroke-dashoffset .6s"}}/>
+      <text x={size/2} y={size/2+4} textAnchor="middle" fontSize={size*.21} fontWeight="700" fill="#1e293b" fontFamily="'Cairo',sans-serif">{value}%</text>
+    </svg>
+  );
+}
+function Pill({label, bg, text, border}) {
+ return <span style={{padding:"2px 9px",borderRadius:99,fontSize:11,fontWeight:700,background:bg,color:text,border:`1px solid ${border||bg}`,whiteSpace:"nowrap"}}>{label}</span>;
+}
+function Btn({children, onClick, col="blue", sm, full, disabled}) {
+  const cols = {
+    blue:  {background:"#1e40af",color:"white"},
+    green: {background:"#15803d",color:"white"},
+    red:   {background:"#ef4444",color:"white"},
+    ghost: {background:"#f1f5f9",color:"#475569"},
+    amber: {background:"#fef9c3",color:"#a16207",border:"1px solid #fde047"},
+  };
+  const st = cols[col] || cols.blue;
+  return (
+    <button onClick={onClick} disabled={disabled}
+ style={{...st, border:st.border||"none", borderRadius:9, cursor:disabled?"not-allowed":"pointer",
+        fontFamily:"inherit", fontWeight:700, padding:sm?"6px 12px":"10px 18px",
+        fontSize:sm?12:14, width:full?"100%":"auto", opacity:disabled?0.5:1}}>
+      {children}
+    </button>
+  );
+}
+function Toast({msg, onDone}) {
+  useEffect(() => { const t = setTimeout(onDone, 3000); return () => clearTimeout(t); }, []);
+ return <div style={{position:"fixed",bottom:80,left:"50%",transform:"translateX(-50%)",background:"#1e293b",color:"white",borderRadius:12,padding:"11px 22px",fontSize:13,fontWeight:600,zIndex:9999,whiteSpace:"nowrap",boxShadow:"0 8px 30px rgba(0,0,0,.25)"}}>{msg}</div>;
+}
+function CD({dd}) {
+  const l = daysLeft(dd), late = l<=0, urg = l>0&&l<=7;
+  const color = late?"#b91c1c":urg?"#a16207":"#15803d";
+  const bg    = late?"#fee2e2":urg?"#fef9c3":"#dcfce7";
+  return (
+ <div style={{display:"flex",alignItems:"center",gap:4,background:bg,borderRadius:99,padding:"3px 10px",flexShrink:0}}>
+ <span style={{fontSize:11}}>⏳</span>
+ <span style={{fontSize:11,fontWeight:800,color}}>{late?`تأخر ${Math.abs(l)} يوم`:`${l} يوم`}</span>
+    </div>
+  );
+}
+function Sheet({children, onClose}) {
+  return (
+ <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",zIndex:800,display:"flex",alignItems:"flex-end",justifyContent:"center",backdropFilter:"blur(2px)"}} onClick={onClose}>
+ <div onClick={ev => ev.stopPropagation()} style={{width:"100%",maxWidth:520,maxHeight:"92vh",overflowY:"auto",background:"white",borderRadius:"20px 20px 0 0",padding:"20px 18px 32px",boxShadow:"0 -8px 40px rgba(0,0,0,.15)"}}>
+        {children}
+      </div>
+    </div>
+  );
+}
+function Confirm({icon, title, body, okLabel, okCol, onOk, onCancel}) {
+  return (
+    <Sheet onClose={onCancel}>
+ <div style={{textAlign:"center",padding:"8px 0"}} dir="rtl">
+ <div style={{fontSize:44,marginBottom:8}}>{icon}</div>
+ <h3 style={{fontSize:17,fontWeight:800,color:"#1e293b",marginBottom:6}}>{title}</h3>
+ <p style={{fontSize:13,color:"#64748b",marginBottom:20,lineHeight:1.6}}>{body}</p>
+ <div style={{display:"flex",gap:10}}>
+          <Btn full col={okCol||"red"} onClick={onOk}>{okLabel}</Btn>
+          <Btn full col="ghost" onClick={onCancel}>إلغاء</Btn>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+function Login({users, settings, onLogin}) {
+  const [u, setU] = useState("");
+  const [p, setP] = useState("");
+  const [err, setErr] = useState("");
+  const [show, setShow] = useState(false);
+  function doLogin() {
+    const user = users.find(x => x.username===u.trim() && x.password===p);
+    if (user) { setErr(""); onLogin(user); }
+    else setErr("اسم المستخدم أو كلمة السر غلط");
+  }
+  return (
+ <div dir="rtl" style={{minHeight:"100vh",background:`linear-gradient(135deg,#1e293b,${settings.color})`,display:"flex",alignItems:"center",justifyContent:"center",padding:16,fontFamily:"'Cairo','Tajawal',sans-serif"}}>
+ <div style={{background:"white",borderRadius:24,padding:32,width:"100%",maxWidth:380,boxShadow:"0 24px 64px rgba(0,0,0,.3)"}}>
+ <div style={{textAlign:"center",marginBottom:28}}>
+          {settings.logo
+ ? <img src={settings.logo} alt="" style={{width:72,height:72,borderRadius:16,objectFit:"contain",margin:"0 auto 10px",display:"block"}}/>
+ : <div style={{width:72,height:72,borderRadius:16,background:settings.color,display:"flex",alignItems:"center",justifyContent:"center",fontSize:36,margin:"0 auto 10px"}}>{settings.emoji}</div>
+          }
+ <h1 style={{fontSize:20,fontWeight:900,color:"#1e293b"}}>{settings.name}</h1>
+ <p style={{fontSize:12,color:"#94a3b8",marginTop:2}}>نظام إدارة المشاريع</p>
+        </div>
+ <div style={{marginBottom:12}}>
+          <label style={LBL}>اسم المستخدم</label>
+          <input value={u} onChange={ev => setU(ev.target.value)} onKeyDown={ev => ev.key==="Enter"&&doLogin()} placeholder="أدخل اسم المستخدم" style={INP}/>
+        </div>
+ <div style={{marginBottom:18,position:"relative"}}>
+          <label style={LBL}>كلمة السر</label>
+          <input type={show?"text":"password"} value={p} onChange={ev => setP(ev.target.value)} onKeyDown={ev => ev.key==="Enter"&&doLogin()} placeholder="أدخل كلمة السر" style={INP}/>
+ <button onClick={() => setShow(v => !v)} style={{position:"absolute",left:12,top:30,background:"none",border:"none",cursor:"pointer",fontSize:16,color:"#94a3b8"}}>{show?"🙈":"👁"}</button>
+        </div>
+ {err && <div style={{background:"#fee2e2",color:"#b91c1c",borderRadius:10,padding:"8px 12px",fontSize:13,fontWeight:600,marginBottom:14,textAlign:"center"}}>{err}</div>}
+ <button onClick={doLogin} style={{width:"100%",background:settings.color,color:"white",border:"none",borderRadius:10,padding:"12px 0",fontSize:15,fontWeight:800,cursor:"pointer",fontFamily:"inherit"}}>تسجيل الدخول</button>
+ <div style={{marginTop:18,padding:12,background:"#f8fafc",borderRadius:12,border:"1px solid #e2e8f0"}}>
+ <div style={{fontSize:11,color:"#94a3b8",fontWeight:700,marginBottom:6}}>حسابات تجريبية (اضغط للملء):</div>
+          {users.map(usr => (
+            <div key={usr.id} onClick={() => { setU(usr.username); setP(usr.password); }}
+ style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"#64748b",marginBottom:4,cursor:"pointer",padding:"3px 6px",borderRadius:6}}>
+              <span>{ROLES[usr.role]?.icon} {usr.name}</span>
+ <span style={{color:"#94a3b8",fontFamily:"monospace"}}>{usr.username}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+function ProjForm({project, role, onSave, onClose}) {
+  const blank = {number:"",name:"",client:"",salesRep:"",region:"",notes:"",status:"نشط",priority:"متوسط",deliveryDays:30,startDate:today(),currentStage:0,completedStages:[],stageCompletedDates:{},stageOverrides:{}};
+  const [f, setF] = useState(project ? {...project, deliveryDays:project.deliveryDays||30} : blank);
+  const [errs, setErrs] = useState({});
+  function setField(k, v) { setF(prev => ({...prev, [k]:v})); setErrs(prev => ({...prev, [k]:""})); }
+  const isNew = !project;
+  const canEditDel = isNew || can(role,"editDelivery");
+  function save() {
+    const erObj = {};
+    if (!f.number.trim()) erObj.number = "رقم المشروع مطلوب ✱";
+    if (!f.region.trim()) erObj.region = "المنطقة مطلوبة ✱";
+    if (Object.keys(erObj).length) { setErrs(erObj); return; }
+    onSave({...f, id:f.id||Date.now(), deliveryDate:addWD(f.startDate, f.deliveryDays)});
+  }
+  const preview = addWD(f.startDate, f.deliveryDays);
+  const sched   = stageSched(f.startDate, f.deliveryDays);
+  return (
+    <Sheet onClose={onClose}>
+      <div dir="rtl">
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+ <h2 style={{fontSize:17,fontWeight:800,color:"#1e293b"}}>{project?"✏️ تعديل المشروع":"➕ مشروع جديد"}</h2>
+ <button onClick={onClose} style={{background:"none",border:"none",fontSize:22,cursor:"pointer",color:"#94a3b8"}}>✕</button>
+        </div>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+ <div style={{gridColumn:"1/-1"}}>
+ <label style={{...LBL,color:errs.number?"#b91c1c":"#64748b"}}>رقم المشروع <span style={{color:"#ef4444"}}>*</span></label>
+ <input value={f.number} onChange={ev => setField("number", ev.target.value)} style={{...INP,borderColor:errs.number?"#ef4444":"#e2e8f0"}}/>
+ {errs.number && <p style={{fontSize:11,color:"#b91c1c",marginTop:3}}>{errs.number}</p>}
+          </div>
+ <div style={{gridColumn:"1/-1"}}>
+ <label style={{...LBL,color:errs.region?"#b91c1c":"#64748b"}}>المنطقة <span style={{color:"#ef4444"}}>*</span></label>
+ <input value={f.region} onChange={ev => setField("region", ev.target.value)} style={{...INP,borderColor:errs.region?"#ef4444":"#e2e8f0"}}/>
+ {errs.region && <p style={{fontSize:11,color:"#b91c1c",marginTop:3}}>{errs.region}</p>}
+          </div>
+ <div style={{gridColumn:"1/-1"}}>
+ <label style={LBL}>اسم المشروع <span style={{fontSize:10,color:"#94a3b8"}}>(اختياري)</span></label>
+            <input value={f.name} onChange={ev => setField("name", ev.target.value)} style={INP}/>
+          </div>
+          <div>
+            <label style={LBL}>العميل</label>
+            <input value={f.client} onChange={ev => setField("client", ev.target.value)} style={INP}/>
+          </div>
+          <div>
+            <label style={LBL}>مسؤول المبيعات</label>
+            <input value={f.salesRep} onChange={ev => setField("salesRep", ev.target.value)} style={INP}/>
+          </div>
+ <div style={{gridColumn:"1/-1"}}>
+ <label style={LBL}>ملاحظات <span style={{fontSize:10,color:"#94a3b8"}}>(اختياري)</span></label>
+ <textarea value={f.notes||""} onChange={ev => setField("notes", ev.target.value)} placeholder="أي ملاحظات خاصة..." style={{...INP,minHeight:60,resize:"vertical",lineHeight:1.6}}/>
+          </div>
+          <div>
+            <label style={LBL}>الحالة</label>
+            <select value={f.status} onChange={ev => setField("status", ev.target.value)} style={INP}>
+              {["نشط","متوقف","مكتمل"].map(s => <option key={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={LBL}>الأولوية</label>
+            <select value={f.priority} onChange={ev => setField("priority", ev.target.value)} style={INP}>
+              {["عالي","متوسط","منخفض"].map(s => <option key={s}>{s}</option>)}
+            </select>
+          </div>
+ <div style={{gridColumn:"1/-1"}}>
+            <label style={LBL}>تاريخ البداية</label>
+ <input type="date" value={f.startDate} onChange={ev => setField("startDate", ev.target.value)} disabled={!canEditDel} style={{...INP,opacity:canEditDel?1:0.6,cursor:canEditDel?"auto":"not-allowed"}}/>
+          </div>
+ <div style={{gridColumn:"1/-1"}}>
+            <label style={LBL}>
+ مدة التسليم (أيام عمل، الجمعة مستثناة): <b style={{color:"#1e40af"}}>{f.deliveryDays} يوم</b>
+ {!canEditDel && <span style={{fontSize:10,color:"#b91c1c",marginRight:8,background:"#fee2e2",borderRadius:6,padding:"1px 6px"}}>🔒 مقفل بعد الحفظ</span>}
+            </label>
+            {canEditDel
+ ? <input type="range" min={1} max={365} value={f.deliveryDays} onChange={ev => setField("deliveryDays", +ev.target.value)} style={{width:"100%",accentColor:"#1e40af",margin:"6px 0"}}/>
+ : <div style={{height:4,background:"#e2e8f0",borderRadius:99,margin:"8px 0"}}><div style={{height:"100%",background:"#93c5fd",borderRadius:99,width:`${Math.min(100,(f.deliveryDays/365)*100)}%`}}/></div>
+            }
+ <div style={{background:"#eff6ff",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#1e40af",fontWeight:700}}>📅 تاريخ التسليم: {preview}</div>
+          </div>
+          {canEditDel && (
+ <div style={{gridColumn:"1/-1"}}>
+              <label style={LBL}>توزيع الأيام على المراحل (معاينة)</label>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>
+                {sched.map((s,si) => (
+ <div key={si} style={{background:"#f8fafc",borderRadius:8,padding:"5px 8px",border:"1px solid #e2e8f0",fontSize:10,color:"#475569"}}>
+                    {s.icon} <b>{s.name}</b>
+ <span style={{display:"block",color:"#94a3b8",marginTop:1}}>{s.days} أيام · {s.endDate.slice(5)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+ <div style={{display:"flex",gap:8}}>
+          <Btn full onClick={save}>{project?"حفظ التعديلات":"إضافة المشروع"}</Btn>
+          <Btn full col="ghost" onClick={onClose}>إلغاء</Btn>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+function LogForm({project, workers, logs, currentStage, role, onSave, onClose}) {
+  const [date, setDate] = useState(today());
+  const [sel, setSel]   = useState({});
+  const [search, setSearch] = useState("");
+  const [filterP, setFilterP] = useState("الكل");
+  const fri = isFri(date);
+  const active = workers.filter(w => (w.status||"نشط")==="نشط");
+  const profs  = ["الكل", ...mkSet(active.map(w => w.prof||"أخرى"))];
+  useEffect(() => {
+    const ex = (logs||[]).find(l => l.projectId===project.id && l.date===date && l.stageIdx===currentStage);
+    if (ex) { const s={}; ex.workers.forEach(w => { s[w.workerId]=true; }); setSel(s); }
+    else setSel({});
+  }, [date, currentStage]);
+  function toggle(id) { setSel(prev => ({...prev, [id]:!prev[id]})); }
+  function selAll(ws) { setSel(prev => { const s={...prev}; ws.forEach(w => { s[w.id]=true; }); return s; }); }
+  function clearAll(ws) { setSel(prev => { const s={...prev}; ws.forEach(w => { delete s[w.id]; }); return s; }); }
+  const filtered = active.filter(w => {
+    const matchP = filterP==="الكل" || (w.prof||"أخرى")===filterP;
+    const matchS = !search || w.name.includes(search) || (w.prof||"").includes(search);
+    return matchP && matchS;
+  });
+  const selW  = active.filter(w => sel[w.id]);
+  const total = selW.reduce((s,w) => { const d=wage(w.salary); return s+(fri?d*1.5:d); }, 0);
+  function doSave() {
+    onSave({
+      id:`${project.id}_${date}_${currentStage}`,
+      projectId:project.id, date, isFriday:fri,
+      stageIdx:currentStage,
+      workers:selW.map(w => ({workerId:w.id,workerName:w.name,profession:w.prof,dailyWage:wage(w.salary),isFriday:fri})),
+      totalCost:total,
+    });
+  }
+  return (
+    <Sheet onClose={onClose}>
+      <div dir="rtl">
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+ <h2 style={{fontSize:17,fontWeight:800,color:"#1e293b"}}>📋 تسجيل حضور</h2>
+ <button onClick={onClose} style={{background:"none",border:"none",fontSize:22,cursor:"pointer",color:"#94a3b8"}}>✕</button>
+        </div>
+ <p style={{fontSize:12,color:"#64748b",marginBottom:10}}>#{project.number} — {project.name||project.region}</p>
+ <div style={{background:"#f0fdf4",border:"1px solid #86efac",borderRadius:10,padding:"9px 12px",marginBottom:12,display:"flex",alignItems:"center",gap:8}}>
+ <span style={{fontSize:18}}>{ICONS[currentStage]}</span>
+          <div>
+ <div style={{fontSize:11,fontWeight:700,color:"#15803d"}}>المرحلة الحالية (تلقائي)</div>
+ <div style={{fontSize:13,fontWeight:800,color:"#1e293b"}}>{STAGES[currentStage]}</div>
+          </div>
+ <span style={{marginRight:"auto",fontSize:10,color:"#15803d",background:"#dcfce7",borderRadius:99,padding:"2px 8px",fontWeight:700}}>تلقائي</span>
+        </div>
+ <div style={{marginBottom:12}}>
+          <label style={LBL}>التاريخ</label>
+          <input type="date" value={date} onChange={ev => setDate(ev.target.value)} style={INP}/>
+ {fri && <div style={{marginTop:6,fontSize:12,color:"#a16207",fontWeight:700,background:"#fef9c3",borderRadius:8,padding:"6px 12px"}}>⚠️ يوم الجمعة — يومية × 1.5</div>}
+        </div>
+        {active.length===0
+ ? <div style={{textAlign:"center",color:"#94a3b8",padding:20,background:"#f8fafc",borderRadius:12,marginBottom:12}}>لا يوجد عمال نشطون</div>
+ : <div style={{marginBottom:12}}>
+              {/* Search */}
+              <input value={search} onChange={ev => setSearch(ev.target.value)}
+                placeholder="🔍 ابحث باسم الموظف أو المهنة..."
+ style={{...INP,marginBottom:8,fontSize:13}}/>
+              {/* Filter by profession */}
+ <div style={{display:"flex",gap:5,overflowX:"auto",paddingBottom:4,marginBottom:10,scrollbarWidth:"none"}}>
+                {profs.map(pr => (
+                  <button key={pr} onClick={() => setFilterP(pr)}
+ style={{padding:"4px 12px",borderRadius:99,border:`1.5px solid ${filterP===pr?"#1e40af":"#e2e8f0"}`,background:filterP===pr?"#1e40af":"white",color:filterP===pr?"white":"#64748b",fontFamily:"inherit",fontWeight:700,fontSize:11,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>
+                    {pr}
+                  </button>
+                ))}
+              </div>
+              {/* Select all / clear for current filter */}
+              {filtered.length>0 && (
+ <div style={{display:"flex",gap:6,marginBottom:8}}>
+ <button onClick={() => selAll(filtered)} style={{fontSize:11,color:"#1e40af",background:"#eff6ff",border:"1px solid #93c5fd",borderRadius:7,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>✓ تحديد الكل</button>
+ <button onClick={() => clearAll(filtered)} style={{fontSize:11,color:"#64748b",background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:7,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",fontWeight:700}}>✕ إلغاء الكل</button>
+ <span style={{fontSize:11,color:"#94a3b8",alignSelf:"center",marginRight:"auto"}}>{filtered.length} موظف</span>
+                </div>
+              )}
+              {/* Workers list */}
+              {filtered.length===0
+ ? <div style={{textAlign:"center",color:"#94a3b8",padding:16,fontSize:12}}>لا توجد نتائج</div>
+                : filtered.map(w => {
+                    const wd = wage(w.salary);
+                    return (
+                      <div key={w.id} onClick={() => toggle(w.id)}
+ style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:10,cursor:"pointer",marginBottom:5,background:sel[w.id]?"#eff6ff":"#f8fafc",border:`1.5px solid ${sel[w.id]?"#3b82f6":"#e2e8f0"}`,transition:"all .15s"}}>
+ <div style={{width:36,height:36,borderRadius:"50%",background:sel[w.id]?"#1e40af":"#cbd5e1",color:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:14,flexShrink:0}}>{w.name[0]}</div>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontWeight:700,fontSize:13,color:"#1e293b"}}>{w.name}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{w.prof||"—"}{can(role,"viewCosts")&&` · ${fmtKWD(wd)} د.ك/يوم`}</div>
+                        </div>
+ {can(role,"viewCosts")&&<b style={{fontSize:13,color:sel[w.id]?"#1e40af":"#94a3b8",flexShrink:0}}>{fmtKWD(fri?wd*1.5:wd)}</b>}
+ <div style={{width:22,height:22,borderRadius:6,background:sel[w.id]?"#1e40af":"#e2e8f0",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+ {sel[w.id] && <span style={{color:"white",fontSize:13,fontWeight:900}}>✓</span>}
+                        </div>
+                      </div>
+                    );
+                  })
+              }
+            </div>
+        }
+        {selW.length>0 && (
+ <div style={{background:"#eff6ff",borderRadius:10,padding:"9px 12px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+ <span style={{fontSize:13,color:"#1e293b"}}>👷 {selW.length} عامل</span>
+ {can(role,"viewCosts")&&<b style={{fontSize:14,color:"#1e40af"}}>{fmtKWD(total)} د.ك</b>}
+          </div>
+        )}
+        <Btn full col="green" disabled={selW.length===0} onClick={doSave}>💾 حفظ الحضور</Btn>
+      </div>
+    </Sheet>
+  );
+}
+function HomePage({projects, workers, logs, settings, role, onNav, onView}) {
+  const spent = projects.reduce((s,p) => s + projCosts(p.id,logs).total, 0);
+  const actW  = workers.filter(w => (w.status||"نشط")==="نشط").length;
+  const avg   = projects.length ? Math.round(projects.reduce((s,p) => s+overall(p),0)/projects.length) : 0;
+  const actP  = projects.filter(p => p.status==="نشط");
+  let delayedCount = 0;
+  projects.forEach(p => {
+    const sc = schedWithOv(p.startDate, p.deliveryDays||30, p.stageOverrides||{});
+    sc.forEach((s,i) => {
+      if (!(p.completedStages||[]).includes(i) && i<=(p.currentStage||0) && stageDelay(s.endDate,false)>0) delayedCount++;
+    });
+  });
+  const kpis = [
+    {icon:"📁", label:"المشاريع",       val:projects.length,       sub:`${actP.length} نشط`,    color:"#1e40af", bg:"#eff6ff"},
+    {icon:"📊", label:"متوسط الإنجاز",  val:`${avg}%`,             sub:"عبر كل المشاريع",       color:"#15803d", bg:"#dcfce7"},
+    {icon:"⚠️", label:"مراحل متأخرة",  val:delayedCount,          sub:"مرحلة",                 color:"#b91c1c", bg:"#fee2e2"},
+    {icon:"👷", label:"العمال النشطون", val:actW,                  sub:`من ${workers.length}`,  color:"#a16207", bg:"#fef9c3"},
+    ...(can(role,"viewCosts") ? [{icon:"💰", label:"إجمالي المصروف", val:fmtKWD(spent)+" "+settings.cur, color:"#0f766e", bg:"#ccfbf1"}] : []),
+  ];
+  return (
+    <div>
+ <div style={{marginBottom:18}}>
+ <h2 style={{fontSize:20,fontWeight:800,color:"#1e293b",marginBottom:2}}>لوحة التحكم</h2>
+ <p style={{fontSize:12,color:"#94a3b8"}}>{mkDate().toLocaleDateString("ar-KW",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
+      </div>
+ <div style={{display:"flex",gap:12,overflowX:"auto",paddingBottom:6,marginBottom:18,scrollbarWidth:"none"}}>
+        {kpis.map((k,ki) => (
+ <div key={ki} style={{...CARD,padding:"14px 16px",minWidth:140,flexShrink:0}}>
+ <div style={{width:36,height:36,borderRadius:10,background:k.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10}}>{k.icon}</div>
+ <div style={{fontSize:String(k.val).length>8?12:22,fontWeight:800,color:"#1e293b",lineHeight:1.1}}>{k.val}</div>
+ <div style={{fontSize:11,color:"#94a3b8",fontWeight:600,marginTop:3}}>{k.label}</div>
+ <div style={{fontSize:11,color:k.color,fontWeight:600,marginTop:1}}>{k.sub}</div>
+          </div>
+        ))}
+      </div>
+ <div style={{...CARD,padding:16,marginBottom:14}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+ <h3 style={{fontSize:14,fontWeight:700,color:"#1e293b"}}>المشاريع النشطة</h3>
+ <button onClick={() => onNav("projects")} style={{fontSize:12,color:"#1e40af",background:"none",border:"none",cursor:"pointer",fontWeight:700}}>عرض الكل ←</button>
+        </div>
+        {actP.slice(0,5).map(p => {
+          const ov = overall(p);
+          return (
+ <div key={p.id} onClick={() => onView(p.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid #f1f5f9",cursor:"pointer"}}>
+              <Ring value={ov} size={44} color={ov>=70?"#15803d":"#1e40af"}/>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontWeight:700,fontSize:13,color:"#1e293b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>#{p.number}{p.name?` — ${p.name}`:""}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{ICONS[p.currentStage||0]} {STAGES[p.currentStage||0]} · 📍{p.region}</div>
+              </div>
+              <CD dd={p.deliveryDate}/>
+            </div>
+          );
+        })}
+ {actP.length===0 && <div style={{textAlign:"center",color:"#94a3b8",padding:20,fontSize:13}}>لا توجد مشاريع نشطة</div>}
+      </div>
+      {can(role,"viewCosts") && (
+ <div style={{...CARD,padding:16}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+ <h3 style={{fontSize:14,fontWeight:700,color:"#1e293b"}}>آخر سجلات الحضور</h3>
+ <button onClick={() => onNav("costs")} style={{fontSize:12,color:"#1e40af",background:"none",border:"none",cursor:"pointer",fontWeight:700}}>عرض الكل ←</button>
+          </div>
+          {logs.slice(0,4).map((l,li) => {
+            const p = projects.find(x => x.id===l.projectId);
+            return (
+ <div key={li} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 0",borderBottom:"1px solid #f1f5f9"}}>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontSize:13,fontWeight:600,color:"#1e293b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p?`#${p.number} ${p.name||p.region}`:"—"}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{l.date}{l.isFriday?" (ج)":""} · {l.workers.length} عمال</div>
+                </div>
+ <b style={{fontSize:13,color:"#0f766e",flexShrink:0}}>{fmtKWD(l.totalCost)} د.ك</b>
+              </div>
+            );
+          })}
+ {logs.length===0 && <div style={{textAlign:"center",color:"#94a3b8",padding:16,fontSize:13}}>لا يوجد سجلات</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+function ProjectsPage({projects, logs, role, onAdd, onEdit, onDelete, onView, onLog}) {
+  const [q, setQ] = useState("");
+  const [f, setF] = useState("الكل");
+  const filtered = projects.filter(p => {
+    const m = !q || [p.name,p.client,p.number,p.salesRep,p.region].some(v => (v||"").toLowerCase().includes(q.toLowerCase()));
+    return m && (f==="الكل" || p.status===f);
+  });
+  return (
+    <div>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,gap:10}}>
+ <div><h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>المشاريع</h2><p style={{fontSize:12,color:"#94a3b8"}}>{projects.length} مشروع</p></div>
+        {can(role,"addProject") && <Btn sm onClick={onAdd}>+ جديد</Btn>}
+      </div>
+ <input value={q} onChange={ev => setQ(ev.target.value)} placeholder="🔍 بحث..." style={{...INP,marginBottom:10}}/>
+ <div style={{display:"flex",gap:6,marginBottom:14,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
+        {["الكل","نشط","متوقف","مكتمل"].map(s => (
+ <button key={s} onClick={() => setF(s)} style={{padding:"6px 14px",borderRadius:99,border:`1.5px solid ${f===s?"#1e40af":"#e2e8f0"}`,background:f===s?"#1e40af":"white",color:f===s?"white":"#64748b",fontFamily:"inherit",fontWeight:700,fontSize:12,cursor:"pointer",whiteSpace:"nowrap"}}>{s}</button>
+        ))}
+      </div>
+ <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {filtered.map(p => {
+          const ov = overall(p), st = PS[p.status]||PS.نشط, cs = p.currentStage||0;
+          const sc = schedWithOv(p.startDate, p.deliveryDays||30, p.stageOverrides||{});
+          const hasDelay = sc.some((s,i) => !(p.completedStages||[]).includes(i) && i<=cs && stageDelay(s.endDate,false)>0);
+          return (
+ <div key={p.id} style={{...CARD,padding:16,borderRight:`4px solid ${PC[p.priority]}`}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+ <div style={{flex:1,minWidth:0,paddingLeft:8,cursor:"pointer"}} onClick={() => onView(p.id)}>
+ <div style={{fontSize:11,color:"#94a3b8",fontWeight:700}}>#{p.number}</div>
+ <div style={{fontSize:15,fontWeight:800,color:"#1e293b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name||p.region}</div>
+ <div style={{fontSize:12,color:"#64748b"}}>{p.client?`${p.client} · `:""}{p.region}</div>
+                </div>
+                <Ring value={ov} size={52} color={ov>=80?"#15803d":ov>=40?"#1e40af":"#ef4444"}/>
+              </div>
+ <div style={{background:"#f8fafc",borderRadius:8,padding:"7px 10px",marginBottom:10,display:"flex",alignItems:"center",gap:8}}>
+ <span style={{fontSize:18}}>{ICONS[cs]}</span>
+ <div style={{flex:1}}>
+ <div style={{fontSize:12,fontWeight:700,color:"#1e293b"}}>مرحلة {cs+1}/9: {STAGES[cs]}</div>
+ <div style={{height:4,background:"#e2e8f0",borderRadius:99,marginTop:4,overflow:"hidden"}}>
+ <div style={{height:"100%",background:"#1e40af",borderRadius:99,width:`${ov}%`}}/>
+                  </div>
+                </div>
+                <CD dd={p.deliveryDate}/>
+              </div>
+ <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+                <Pill label={p.status} {...st}/>
+                <Pill label={p.priority} bg={PC[p.priority]+"18"} text={PC[p.priority]} border={PC[p.priority]+"44"}/>
+                {p.salesRep && <Pill label={`👤 ${p.salesRep}`} bg="#f1f5f9" text="#475569" border="#e2e8f0"/>}
+                {hasDelay && <Pill label="⚠️ تأخير في مرحلة" bg="#fee2e2" text="#b91c1c" border="#fca5a5"/>}
+              </div>
+ <div style={{display:"flex",gap:6}}>
+ {can(role,"logAttendance") && <button onClick={() => onLog(p)} style={{flex:1,padding:"7px 0",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:8,fontSize:12,fontWeight:700,color:"#15803d",cursor:"pointer",fontFamily:"inherit"}}>📋 حضور</button>}
+ <button onClick={() => onView(p.id)} style={{flex:1,padding:"7px 0",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,fontSize:12,fontWeight:700,color:"#475569",cursor:"pointer",fontFamily:"inherit"}}>👁 عرض</button>
+ {can(role,"editProject") && <button onClick={() => onEdit(p)} style={{padding:"7px 14px",background:"#eff6ff",border:"1px solid #93c5fd",borderRadius:8,fontSize:12,fontWeight:700,color:"#1d4ed8",cursor:"pointer",fontFamily:"inherit"}}>✏️</button>}
+ {can(role,"deleteProject") && <button onClick={() => onDelete(p.id,p.number)} style={{padding:"7px 14px",background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,fontSize:12,fontWeight:700,color:"#b91c1c",cursor:"pointer",fontFamily:"inherit"}}>🗑</button>}
+              </div>
+            </div>
+          );
+        })}
+ {filtered.length===0 && <div style={{textAlign:"center",padding:60,color:"#94a3b8",fontSize:14}}>لا توجد مشاريع</div>}
+      </div>
+    </div>
+  );
+}
+function ProjectDetail({project, logs, role, onBack, onEdit, onDelete, onLog, setProjects, setToast}) {
+  const [stCf, setStCf] = useState(null);
+  const ov = overall(project);
+  const c  = projCosts(project.id, logs);
+  const cs = project.currentStage || 0;
+  const sc = schedWithOv(project.startDate, project.deliveryDays||30, project.stageOverrides||{});
+  const delayed = sc.filter((s,i) => !(project.completedStages||[]).includes(i) && stageDelay(s.endDate,false)>0 && i<=cs);
+  function advance() {
+    const isLast = cs >= STAGES.length-1;
+    const {newOv, saved} = applyCarryover(project, cs);
+    setProjects(prev => prev.map(p => p.id!==project.id ? p : {
+      ...p,
+      currentStage: isLast ? cs : cs+1,
+      completedStages: [...(p.completedStages||[]), cs],
+      stageCompletedDates: {...(p.stageCompletedDates||{}), [cs]:today()},
+      stageOverrides: newOv,
+      status: isLast ? "مكتمل" : p.status,
+    }));
+    setToast(isLast?"🏁 اكتمل المشروع!":saved>0?`✅ انتقل للتالية — ⚡ وُفِّر ${saved} يوم`:"✅ انتقل للمرحلة التالية");
+    setStCf(null);
+  }
+  function revert() {
+    if (!cs) return;
+    const ps = cs-1;
+    const nc = (project.completedStages||[]).filter(s => s!==ps);
+    const nd = {...(project.stageCompletedDates||{})}; delete nd[ps];
+    const no = {...(project.stageOverrides||{})}; for(let i=ps;i<STAGES.length;i++) delete no[i];
+    setProjects(prev => prev.map(p => p.id!==project.id ? p : {...p,currentStage:ps,completedStages:nc,stageCompletedDates:nd,stageOverrides:no,status:"نشط"}));
+    setToast("↩️ تم الرجوع للمرحلة السابقة");
+    setStCf(null);
+  }
+  return (
+    <div>
+ <button onClick={onBack} style={{background:"#f1f5f9",border:"none",borderRadius:8,padding:"8px 14px",fontWeight:700,cursor:"pointer",fontSize:13,color:"#475569",fontFamily:"inherit",marginBottom:14}}>← رجوع</button>
+ <div style={{...CARD,padding:16,marginBottom:14}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontSize:11,color:"#94a3b8",fontWeight:700}}>#{project.number}</div>
+ <h2 style={{fontSize:18,fontWeight:800,color:"#1e293b"}}>{project.name||project.region}</h2>
+ <div style={{fontSize:12,color:"#64748b",marginTop:2}}>{project.client&&`${project.client} · `}📍{project.region}{project.salesRep&&` · 👤${project.salesRep}`}</div>
+          </div>
+          <Ring value={ov} size={66} stroke={6} color={ov>=80?"#15803d":"#1e40af"}/>
+        </div>
+ <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",marginBottom:12}}>
+          <Pill label={project.status} {...(PS[project.status]||PS.نشط)}/>
+          <Pill label={project.priority} bg={PC[project.priority]+"18"} text={PC[project.priority]} border={PC[project.priority]+"44"}/>
+          <CD dd={project.deliveryDate}/>
+ <span style={{fontSize:11,color:"#94a3b8"}}>📅 {project.deliveryDate}</span>
+        </div>
+        {project.notes && (
+ <div style={{background:"#fefce8",border:"1px solid #fde047",borderRadius:10,padding:"9px 12px",marginBottom:12,fontSize:13,color:"#713f12",lineHeight:1.6}}>📝 <b>ملاحظات:</b> {project.notes}</div>
+        )}
+        {can(role,"viewCosts") && c.total>0 && (
+ <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12}}>
+            <Pill label={`💰 ${fmtKWD(c.total)} د.ك`} bg="#ccfbf1" text="#0f766e" border="#99f6e4"/>
+            <Pill label={`👷 ${c.wDays} يوم`} bg="#dbeafe" text="#1d4ed8" border="#93c5fd"/>
+          </div>
+        )}
+        {delayed.length>0 && (
+ <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:10,padding:"10px 14px",marginBottom:12}}>
+ <div style={{fontSize:13,fontWeight:800,color:"#b91c1c",marginBottom:6}}>⚠️ تنبيه — مراحل متأخرة</div>
+            {delayed.map((s,di) => (
+ <div key={di} style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#7f1d1d",marginBottom:3}}>
+                <span>{s.icon} {s.name}</span>
+ <span style={{fontWeight:700}}>تأخر {stageDelay(s.endDate,false)}%</span>
+              </div>
+            ))}
+          </div>
+        )}
+ <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+ {can(role,"logAttendance") && <button onClick={() => onLog(project)} style={{flex:1,minWidth:100,padding:"8px 0",background:"#dcfce7",border:"1px solid #86efac",borderRadius:8,fontSize:12,fontWeight:700,color:"#15803d",cursor:"pointer",fontFamily:"inherit"}}>📋 سجل حضور</button>}
+ {can(role,"editProject") && <button onClick={() => onEdit(project)} style={{flex:1,minWidth:80,padding:"8px 0",background:"#dbeafe",border:"1px solid #93c5fd",borderRadius:8,fontSize:12,fontWeight:700,color:"#1d4ed8",cursor:"pointer",fontFamily:"inherit"}}>✏️ تعديل</button>}
+ {can(role,"deleteProject") && <button onClick={() => onDelete(project.id,project.number)} style={{padding:"8px 14px",background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,fontSize:12,fontWeight:700,color:"#b91c1c",cursor:"pointer",fontFamily:"inherit"}}>🗑</button>}
+        </div>
+      </div>
+      {/* Stages Timeline */}
+ <div style={{...CARD,padding:16,marginBottom:14}}>
+ <h3 style={{fontSize:14,fontWeight:700,color:"#1e293b",marginBottom:16}}>🗂 مراحل المشروع</h3>
+        {sc.map((stg,i) => {
+          const isDone   = (project.completedStages||[]).includes(i);
+          const isActive = i===cs && !isDone;
+          const isFuture = i>cs && !isDone;
+          const isLast   = i===STAGES.length-1;
+          const doneDate = (project.stageCompletedDates||{})[i] || null;
+          const delay    = stageDelay(stg.endDate, isDone);
+          const dc       = delay===0?"#15803d":delay<30?"#a16207":"#b91c1c";
+          const sw       = stageWorkers(i, project, logs);
+          return (
+ <div key={i} style={{display:"flex",gap:10,marginBottom:isLast?0:6}}>
+ <div style={{display:"flex",flexDirection:"column",alignItems:"center",width:38,flexShrink:0}}>
+ <div style={{width:38,height:38,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,background:isDone?"#dcfce7":isActive?"#dbeafe":"#f1f5f9",border:`2px solid ${isDone?"#86efac":isActive?"#93c5fd":"#e2e8f0"}`,animation:isActive?"glow 2s infinite":"none"}}>{ICONS[i]}</div>
+ {!isLast && <div style={{width:2,flex:1,minHeight:10,background:isDone?"#86efac":"#e2e8f0",margin:"2px 0"}}/>}
+              </div>
+ <div style={{flex:1,padding:"10px 12px",borderRadius:10,marginBottom:isLast?0:4,opacity:isFuture?0.6:1,background:isActive?"#eff6ff":isDone?"#f0fdf4":"#fafafa",border:`1px solid ${isActive?"#93c5fd":isDone?"#86efac":"#e2e8f0"}`}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:4,marginBottom:4}}>
+ <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
+ <b style={{fontSize:13,color:isDone?"#15803d":isActive?"#1d4ed8":"#64748b"}}>{stg.name}</b>
+                    {isDone   && <Pill label={`✓ ${doneDate||""}`} bg="#dcfce7" text="#15803d" border="#86efac"/>}
+                    {isActive && <Pill label="● جارية" bg="#dbeafe" text="#1d4ed8" border="#93c5fd"/>}
+ {isFuture && <span style={{fontSize:10,color:"#b0bec5"}}>⏳ قادمة</span>}
+                  </div>
+ <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
+ <span style={{fontSize:10,color:"#94a3b8",background:"#f1f5f9",borderRadius:6,padding:"1px 7px"}}>{stg.days} يوم</span>
+ <span style={{fontSize:10,color:"#94a3b8"}}>📅{stg.endDate}</span>
+                    {delay>0 && !isDone && <Pill label={`⚠️ ${delay}%`} bg={dc+"18"} text={dc} border={dc+"44"}/>}
+                  </div>
+                </div>
+                {/* Stage workers */}
+                {(isDone||isActive) && sw.length>0 && (
+ <div style={{marginTop:8,background:"#f8fafc",borderRadius:8,padding:"8px 10px",border:"1px solid #e2e8f0"}}>
+ <div style={{fontSize:11,fontWeight:700,color:"#475569",marginBottom:6}}>👷 من اشتغل في هذه المرحلة:</div>
+ <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                      {sw.map((w,wi) => (
+ <div key={wi} style={{display:"flex",alignItems:"center",gap:8,fontSize:12}}>
+ <div style={{width:26,height:26,borderRadius:"50%",background:"#1e40af",color:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:11,flexShrink:0}}>{w.name[0]}</div>
+ <div style={{flex:1}}>
+ <span style={{fontWeight:600,color:"#1e293b"}}>{w.name}</span>
+ <span style={{color:"#94a3b8",marginRight:4}}>· {w.prof}</span>
+ {w.shared && <span style={{fontSize:10,background:"#fef9c3",color:"#a16207",borderRadius:99,padding:"1px 6px",fontWeight:700,marginRight:4}}>مشترك</span>}
+                          </div>
+ <div style={{textAlign:"left",flexShrink:0}}>
+ <span style={{fontSize:11,color:"#64748b"}}>{w.days} يوم</span>
+ {can(role,"viewCosts") && <span style={{fontSize:12,fontWeight:700,color:"#0f766e",marginRight:6}}>{fmtKWD(w.cost)} د.ك</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {isActive && sw.length===0 && (
+ <div style={{marginTop:8,fontSize:11,color:"#94a3b8",background:"#f8fafc",borderRadius:8,padding:"7px 10px"}}>لا يوجد سجلات حضور لهذه المرحلة بعد</div>
+                )}
+                {isActive && can(role,"advanceStage") && project.status!=="مكتمل" && (
+ <div style={{display:"flex",gap:6,marginTop:10,flexWrap:"wrap"}}>
+                    <Btn sm col="green" onClick={() => setStCf("advance")}>{i===STAGES.length-1?"🏁 إنهاء المشروع":"✅ إنهاء والانتقال للتالية"}</Btn>
+                    {i>0 && <Btn sm col="amber" onClick={() => setStCf("back")}>↩️ رجوع</Btn>}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {/* Attendance Log */}
+      {can(role,"viewCosts") && c.logs.length>0 && (
+ <div style={{...CARD,padding:16}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b"}}>📋 سجل الحضور</h3>
+ <b style={{color:"#0f766e",fontSize:13}}>{fmtKWD(c.total)} د.ك</b>
+          </div>
+          {c.logs.map((l,li) => {
+            let dayCost = 0;
+            const seenW = mkSet();
+            l.workers.forEach(w => {
+              if (seenW.has(w.workerId)) return;
+              seenW.add(w.workerId);
+              dayCost += (w.dailyWage*(l.isFriday?1.5:1))/splitCount(w.workerId,l.date,logs);
+            });
+            const hasSplit = l.workers.some(w => splitCount(w.workerId,l.date,logs)>1);
+            return (
+ <div key={li} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid #f8fafc"}}>
+ <span style={{fontSize:11,fontWeight:700,color:"#475569",flexShrink:0,minWidth:75}}>{l.date}{l.isFriday&&<b style={{color:"#a16207"}}> ج</b>}</span>
+ {l.stageIdx!==undefined && <span style={{fontSize:10,background:"#dbeafe",color:"#1e40af",borderRadius:99,padding:"1px 7px",fontWeight:700,flexShrink:0,whiteSpace:"nowrap"}}>{ICONS[l.stageIdx]} {STAGES[l.stageIdx]}</span>}
+ <span style={{flex:1,fontSize:11,color:"#64748b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.workers.map(w => w.workerName).join(" · ")}</span>
+ <div style={{textAlign:"left",flexShrink:0}}>
+ <b style={{fontSize:12,color:"#0f766e"}}>{fmtKWD(dayCost)} د.ك</b>
+ {hasSplit && <div style={{fontSize:10,color:"#a16207",fontWeight:600}}>مقسومة</div>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {stCf && (stCf==="advance"
+        ? <Confirm icon="✅" title="تأكيد إنهاء المرحلة" body="سيتم تسجيل تاريخ الإنهاء والانتقال للمرحلة التالية." okLabel="نعم، إنهاء" okCol="green" onOk={advance} onCancel={() => setStCf(null)}/>
+        : <Confirm icon="↩️" title="الرجوع للمرحلة السابقة" body="هل تريد إلغاء إنهاء المرحلة والرجوع للسابقة؟" okLabel="نعم، ارجع" okCol="blue" onOk={revert} onCancel={() => setStCf(null)}/>
+      )}
+    </div>
+  );
+}
+function WorkersPage({workers, logs, onSave}) {
+  const [list, setList]     = useState(workers.map(w => ({...w})));
+  const [nm, setNm]         = useState("");
+  const [sal, setSal]       = useState("");
+  const [prof, setProf]     = useState("");
+  const [changed, setChanged] = useState(false);
+  const [delW, setDelW]     = useState(null);
+  useEffect(() => { setList(workers.map(w => ({...w}))); setChanged(false); }, [workers]);
+  function upd(id, k, v) { setList(prev => prev.map(w => w.id===id ? {...w,[k]:v} : w)); setChanged(true); }
+  function deleteW(id) {
+    setList(prev => prev.filter(w => w.id!==id));
+    setChanged(true); setDelW(null);
+  }
+  function addWorker() {
+    if (!nm.trim() || !sal) return;
+    setList(prev => [...prev, {id:"w"+Date.now(), name:nm.trim(), salary:+sal, prof:prof.trim()||"—", status:"نشط"}]);
+    setNm(""); setSal(""); setProf(""); setChanged(true);
+  }
+  return (
+    <div>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+ <div><h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>الموظفون</h2><p style={{fontSize:12,color:"#94a3b8"}}>{list.filter(w=>(w.status||"نشط")==="نشط").length} نشط من {list.length}</p></div>
+        {changed && <Btn sm col="green" onClick={() => onSave(list)}>💾 حفظ</Btn>}
+      </div>
+ <div style={{...CARD,padding:14,marginBottom:14}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b",marginBottom:12}}>➕ إضافة موظف</h3>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+ <div style={{gridColumn:"1/-1"}}>
+            <label style={LBL}>الاسم</label>
+            <input value={nm} onChange={ev => setNm(ev.target.value)} placeholder="اسم الموظف" style={INP}/>
+          </div>
+          <div>
+            <label style={LBL}>الراتب الشهري (د.ك)</label>
+            <input type="number" value={sal} onChange={ev => setSal(ev.target.value)} placeholder="200" style={INP}/>
+ {sal && <div style={{fontSize:11,color:"#15803d",marginTop:3}}>يومية: {fmtKWD(wage(+sal))} د.ك</div>}
+          </div>
+          <div>
+            <label style={LBL}>المهنة</label>
+            <input value={prof} onChange={ev => setProf(ev.target.value)} placeholder="مثال: حداد، صباغ..." list="prof-list" style={INP}/>
+            <datalist id="prof-list">
+              {PROFS.map(pr => <option key={pr} value={pr}/>)}
+            </datalist>
+          </div>
+        </div>
+        <Btn full onClick={addWorker}>إضافة</Btn>
+      </div>
+ <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {list.map(w => {
+          const ws = WS[w.status||"نشط"] || WS.نشط;
+          let wt = 0;
+          const seenDays1 = mkSet();
+          logs.forEach(l => {
+            const wr = l.workers.find(x => x.workerId===w.id);
+            if (!wr) return;
+            const key = w.id + "_" + l.date + "_" + l.projectId;
+            if (seenDays1.has(key)) return;
+            seenDays1.add(key);
+            const sc = splitCount(w.id, l.date, logs);
+            wt += (wr.dailyWage*(l.isFriday?1.5:1))/sc;
+          });
+          return (
+ <div key={w.id} style={{...CARD,padding:14,border:`1.5px solid ${ws.border}`}}>
+ <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+ <div style={{width:40,height:40,borderRadius:"50%",background:ws.bg,border:`2px solid ${ws.border}`,color:ws.text,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:16,flexShrink:0}}>{w.name[0]}</div>
+ <div style={{flex:1,minWidth:0}}>
+ <input value={w.name} onChange={ev => upd(w.id,"name",ev.target.value)} style={{border:"none",background:"transparent",fontSize:14,fontFamily:"inherit",fontWeight:700,color:"#1e293b",outline:"none",width:"100%"}}/>
+ <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:3}}>
+                    <Pill label={w.status||"نشط"} {...ws}/>
+                    <Pill label={`🔧 ${w.prof||"—"}`} bg="#dbeafe" text="#1d4ed8" border="#93c5fd"/>
+                    <Pill label={`${fmtKWD(wt)} د.ك`} bg="#ccfbf1" text="#0f766e" border="#99f6e4"/>
+                  </div>
+                </div>
+ <button onClick={() => setDelW(w)} style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"6px 10px",fontSize:12,fontWeight:700,color:"#b91c1c",cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>🗑</button>
+              </div>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                <div>
+                  <label style={LBL}>الراتب (د.ك)</label>
+ <input type="number" value={w.salary} onChange={ev => upd(w.id,"salary",+ev.target.value)} style={{...INP,padding:"6px 8px",fontSize:13}}/>
+                </div>
+                <div>
+                  <label style={LBL}>المهنة</label>
+ <input value={w.prof||""} onChange={ev => upd(w.id,"prof",ev.target.value)} list="prof-list" style={{...INP,padding:"6px 8px",fontSize:12}}/>
+                </div>
+                <div>
+                  <label style={LBL}>الحالة</label>
+                  <select value={w.status||"نشط"} onChange={ev => upd(w.id,"status",ev.target.value)}
+ style={{...INP,padding:"6px 8px",fontSize:12,background:WS[w.status||"نشط"]?.bg||"#dcfce7",color:WS[w.status||"نشط"]?.text||"#15803d",fontWeight:700}}>
+                    {["نشط","إجازة"].map(s => <option key={s}>{s}</option>)}
+                  </select>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+ {list.length===0 && <div style={{textAlign:"center",color:"#94a3b8",padding:40}}>لا يوجد موظفون</div>}
+      </div>
+      {delW && (
+        <Confirm
+          icon="🗑" title={`حذف ${delW.name}؟`}
+          body="سيتم حذف الموظف نهائياً. سجلات الحضور السابقة ستبقى محفوظة."
+          okLabel="نعم، احذف" okCol="red"
+          onOk={() => deleteW(delW.id)}
+          onCancel={() => setDelW(null)}
+        />
+      )}
+    </div>
+  );
+}
+function CostsPage({projects, workers, logs, settings, role, onLog, onExport}) {
+  const [exp, setExp] = useState(null);
+  const total = projects.reduce((s,p) => s + projCosts(p.id,logs).total, 0);
+  return (
+    <div>
+ <div style={{marginBottom:14}}>
+ <h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>التكاليف</h2>
+ <p style={{fontSize:12,color:"#94a3b8"}}>تقرير شامل لتكاليف العمالة</p>
+      </div>
+ <div style={{display:"flex",gap:10,overflowX:"auto",paddingBottom:6,marginBottom:14,scrollbarWidth:"none"}}>
+        {[
+          {icon:"💰",label:"إجمالي المصروف",val:fmtKWD(total)+" "+settings.cur,color:"#0f766e",bg:"#ccfbf1"},
+          {icon:"👷",label:"أيام العمال",   val:(()=>{const s=mkSet();logs.forEach(l=>l.workers.forEach(w=>s.add(w.workerId+"_"+l.date)));return s.size;})(),color:"#1e40af",bg:"#dbeafe"},
+          {icon:"📅",label:"أيام مسجلة",   val:(()=>mkSet(logs.map(l=>l.date)).size)(),color:"#7e22ce",bg:"#f3e8ff"},
+          {icon:"🔧",label:"عمال نشطون",   val:workers.filter(w=>(w.status||"نشط")==="نشط").length,color:"#a16207",bg:"#fef9c3"},
+        ].map((k,ki) => (
+ <div key={ki} style={{...CARD,padding:"12px 14px",minWidth:128,flexShrink:0}}>
+ <div style={{width:32,height:32,borderRadius:8,background:k.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,marginBottom:8}}>{k.icon}</div>
+ <div style={{fontSize:String(k.val).length>8?12:20,fontWeight:800,color:"#1e293b"}}>{k.val}</div>
+ <div style={{fontSize:10,color:"#94a3b8",fontWeight:600,marginTop:2}}>{k.label}</div>
+          </div>
+        ))}
+      </div>
+      {/* Workers breakdown */}
+ <div style={{...CARD,padding:14,marginBottom:14}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b",marginBottom:12}}>👷 تكلفة كل موظف</h3>
+        {workers.map(w => {
+          const ws = WS[w.status||"نشط"];
+          let wt = 0, days = 0;
+          const seenDays2 = mkSet();
+          logs.forEach(l => {
+            const wr = l.workers.find(x => x.workerId===w.id);
+            if (!wr) return;
+            const key = w.id + "_" + l.date + "_" + l.projectId;
+            if (seenDays2.has(key)) return;
+            seenDays2.add(key);
+            const sc = splitCount(w.id, l.date, logs);
+            wt += (wr.dailyWage*(l.isFriday?1.5:1))/sc;
+            days++;
+          });
+          return (
+ <div key={w.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 0",borderBottom:"1px solid #f1f5f9"}}>
+ <div style={{width:34,height:34,borderRadius:"50%",background:ws.bg,color:ws.text,border:`2px solid ${ws.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:14,flexShrink:0}}>{w.name[0]}</div>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontWeight:700,fontSize:13,color:"#1e293b"}}>{w.name}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{w.prof} · {days} يوم</div>
+              </div>
+ <b style={{fontSize:13,color:"#0f766e",flexShrink:0}}>{fmtKWD(wt)} د.ك</b>
+            </div>
+          );
+        })}
+      </div>
+      {/* Per project */}
+ <div style={{...CARD,overflow:"hidden"}}>
+ <div style={{padding:"12px 14px",borderBottom:"1px solid #f1f5f9"}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b"}}>📋 تكاليف المشاريع</h3>
+        </div>
+        {projects.map(p => {
+          const c = projCosts(p.id, logs), isOpen = exp===p.id;
+          return (
+ <div key={p.id} style={{borderBottom:"1px solid #f1f5f9"}}>
+ <div style={{display:"flex",alignItems:"center",gap:10,padding:"12px 14px",cursor:"pointer",background:isOpen?"#f8fafc":"white"}} onClick={() => setExp(isOpen?null:p.id)}>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontWeight:700,fontSize:13,color:"#1e293b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>#{p.number} — {p.name||p.region}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{c.wDays} يوم · {c.unique} عمال</div>
+                </div>
+ <b style={{fontSize:14,color:"#0f766e",flexShrink:0}}>{fmtKWD(c.total)} د.ك</b>
+                {can(role,"logAttendance") && (
+ <button onClick={ev => { ev.stopPropagation(); onLog(p); }} style={{background:"#dcfce7",border:"1px solid #86efac",borderRadius:7,padding:"4px 8px",fontSize:11,fontWeight:700,color:"#15803d",cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>+ سجل</button>
+                )}
+                {can(role,"exportExcel") && c.logs.length>0 && (
+ <button onClick={ev => { ev.stopPropagation(); onExport(p); }} style={{background:"#dbeafe",border:"1px solid #93c5fd",borderRadius:7,padding:"4px 8px",fontSize:11,fontWeight:700,color:"#1d4ed8",cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>📥 Excel</button>
+                )}
+ <span style={{color:"#94a3b8",fontSize:14,flexShrink:0}}>{isOpen?"▲":"▼"}</span>
+              </div>
+              {isOpen && (
+ <div style={{padding:"0 14px 12px",background:"#fafafa"}}>
+                  {c.logs.length===0
+ ? <div style={{textAlign:"center",color:"#94a3b8",padding:14,fontSize:12}}>لا يوجد سجلات</div>
+                    : c.logs.map((l,li) => {
+                        let dc = 0;
+                        const seenWC = mkSet();
+                        l.workers.forEach(w => {
+                          if (seenWC.has(w.workerId)) return;
+                          seenWC.add(w.workerId);
+                          dc += (w.dailyWage*(l.isFriday?1.5:1))/splitCount(w.workerId,l.date,logs);
+                        });
+                        return (
+ <div key={li} style={{display:"flex",alignItems:"center",gap:8,fontSize:12,padding:"6px 0",borderBottom:"1px solid #f1f5f9"}}>
+ <span style={{color:"#475569",fontWeight:600,flexShrink:0}}>{l.date}{l.isFriday&&<b style={{color:"#a16207"}}> ج</b>}</span>
+ {l.stageIdx!==undefined && <span style={{fontSize:10,background:"#dbeafe",color:"#1e40af",borderRadius:99,padding:"1px 6px",fontWeight:700,flexShrink:0}}>{STAGES[l.stageIdx]}</span>}
+ <span style={{flex:1,color:"#64748b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.workers.map(w => w.workerName).join(" · ")}</span>
+ <b style={{color:"#0f766e",flexShrink:0}}>{fmtKWD(dc)} د.ك</b>
+                          </div>
+                        );
+                      })
+                  }
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+const ABSENCE_REASONS = ["مريض","إجازة","إصابة","بدون سبب","أخرى"];
+function AbsencePage({workers, absences, onSave}) {
+  const [date, setDate]     = useState(today());
+  const [sel, setSel]       = useState({});   // {workerId: reason}
+  const [notes, setNotes]   = useState({});   // {workerId: note}
+  const [search, setSearch] = useState("");
+  useEffect(() => {
+    const ex = absences.filter(a => a.date===date);
+    const s = {}, n = {};
+    ex.forEach(a => { s[a.workerId]=a.reason; n[a.workerId]=a.note||""; });
+    setSel(s); setNotes(n);
+  }, [date, absences]);
+  const active = workers.filter(w => (w.status||"نشط")==="نشط");
+  const shown  = active.filter(w => !search || w.name.includes(search) || (w.prof||"").includes(search));
+  const selIds = Object.keys(sel);
+  function toggle(id) {
+    setSel(prev => {
+      const next = {...prev};
+      if (next[id]) delete next[id];
+      else next[id] = "بدون سبب";
+      return next;
+    });
+  }
+  function setReason(id, r) { setSel(prev => ({...prev, [id]:r})); }
+  function setNote(id, v)   { setNotes(prev => ({...prev, [id]:v})); }
+  function doSave() {
+    const newAbs = Object.entries(sel).map(([wid, reason]) => ({
+      id: wid+"_"+date,
+      workerId: wid,
+      workerName: workers.find(w=>w.id===wid)?.name||"—",
+      date, reason,
+      note: notes[wid]||"",
+    }));
+    onSave(date, newAbs);
+  }
+  return (
+    <div>
+ <div style={{marginBottom:14}}>
+ <h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>تسجيل الغياب</h2>
+ <p style={{fontSize:12,color:"#94a3b8"}}>حدد الغائبين واسباب غيابهم</p>
+      </div>
+      {/* Date */}
+ <div style={{...CARD,padding:14,marginBottom:14}}>
+        <label style={LBL}>التاريخ</label>
+        <input type="date" value={date} onChange={ev=>setDate(ev.target.value)} style={INP}/>
+ {isFri(date) && <div style={{marginTop:8,fontSize:12,color:"#a16207",fontWeight:700,background:"#fef9c3",borderRadius:8,padding:"6px 12px"}}>يوم جمعة — إجازة رسمية</div>}
+      </div>
+      {/* Search */}
+ <input value={search} onChange={ev=>setSearch(ev.target.value)} placeholder="🔍 ابحث باسم الموظف..." style={{...INP,marginBottom:10}}/>
+      {/* Workers */}
+ <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:14}}>
+        {shown.map(w => {
+          const isAbs = !!sel[w.id];
+          return (
+ <div key={w.id} style={{...CARD,padding:12,border:`1.5px solid ${isAbs?"#fca5a5":"#e2e8f0"}`,background:isAbs?"#fff5f5":"white"}}>
+ <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:isAbs?10:0}}>
+ <div onClick={()=>toggle(w.id)} style={{width:36,height:36,borderRadius:"50%",background:isAbs?"#fee2e2":"#f1f5f9",color:isAbs?"#b91c1c":"#64748b",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:16,flexShrink:0,cursor:"pointer",border:`2px solid ${isAbs?"#fca5a5":"#e2e8f0"}`}}>{w.name[0]}</div>
+ <div style={{flex:1,cursor:"pointer"}} onClick={()=>toggle(w.id)}>
+ <div style={{fontWeight:700,fontSize:13,color:isAbs?"#b91c1c":"#1e293b"}}>{w.name}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{w.prof||"—"}</div>
+                </div>
+ <div onClick={()=>toggle(w.id)} style={{width:24,height:24,borderRadius:6,background:isAbs?"#ef4444":"#f1f5f9",border:`2px solid ${isAbs?"#ef4444":"#e2e8f0"}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",flexShrink:0}}>
+ {isAbs && <span style={{color:"white",fontSize:14,fontWeight:900}}>✕</span>}
+                </div>
+              </div>
+              {isAbs && (
+ <div style={{display:"flex",flexDirection:"column",gap:6}}>
+ <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                    {ABSENCE_REASONS.map(r => (
+                      <button key={r} onClick={()=>setReason(w.id,r)}
+ style={{padding:"4px 10px",borderRadius:99,border:`1.5px solid ${sel[w.id]===r?"#ef4444":"#e2e8f0"}`,background:sel[w.id]===r?"#fee2e2":"white",color:sel[w.id]===r?"#b91c1c":"#64748b",fontFamily:"inherit",fontWeight:700,fontSize:11,cursor:"pointer"}}>
+                        {r}
+                      </button>
+                    ))}
+                  </div>
+                  {sel[w.id]==="أخرى" && (
+                    <input value={notes[w.id]||""} onChange={ev=>setNote(w.id,ev.target.value)}
+ placeholder="اكتب الملاحظة..." style={{...INP,padding:"6px 10px",fontSize:12}}/>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+ {shown.length===0 && <div style={{textAlign:"center",color:"#94a3b8",padding:30}}>لا توجد نتائج</div>}
+      </div>
+      {/* Summary */}
+      {selIds.length>0 && (
+ <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:10,padding:"10px 14px",marginBottom:14}}>
+ <div style={{fontSize:13,fontWeight:700,color:"#b91c1c",marginBottom:4}}>غائبون اليوم: {selIds.length}</div>
+          {selIds.map(id => {
+            const w = workers.find(x=>x.id===id);
+ return <div key={id} style={{fontSize:12,color:"#7f1d1d"}}>{w?.name} — {sel[id]}{notes[id]?` (${notes[id]})`:""}</div>;
+          })}
+        </div>
+      )}
+      <Btn full col="green" onClick={doSave}>💾 حفظ الغياب</Btn>
+    </div>
+  );
+}
+function exportReportCSV(tab, {projects, workers, logs, absences, filtLogs, filtAbs, overtime, absReport, settings}) {
+  const cur = settings?.cur || "د.ك";
+  let rows = [];
+  const BOM = "﻿";
+  if (tab === "compare") {
+    rows.push(["مقارنة المشاريع"]);
+    rows.push(["#", "المشروع", "المنطقة", "الحالة", "الإنجاز%", `التكلفة (${cur})`, "الأيام المتبقية", "العمال"]);
+    projects.forEach(p => {
+      const ov = overall(p), dl = daysLeft(p.deliveryDate);
+      const c  = projCosts(p.id, logs);
+      const uniq = mkSet(logs.filter(l=>l.projectId===p.id).flatMap(l=>l.workers.map(w=>w.workerId))).size;
+      rows.push([p.number, p.name||"—", p.region, p.status, ov+"%", fmtKWD(c.total), p.status==="مكتمل"?"مكتمل":dl<0?`تأخر ${Math.abs(dl)}`:`${dl} يوم`, uniq]);
+    });
+  } else if (tab === "overtime") {
+    rows.push(["تقرير العمل الإضافي (الجمعة)"]);
+    rows.push(["الموظف", "المهنة", "عدد الجمع", `الإجمالي (${cur})`, "التواريخ"]);
+    overtime.forEach(w => rows.push([w.name, w.prof, w.days.length, fmtKWD(w.total), w.days.join(" / ")]));
+  } else if (tab === "absence") {
+    rows.push(["تقرير الغياب"]);
+    rows.push(["الموظف", "التاريخ", "السبب", "ملاحظة"]);
+    filtAbs.forEach(a => rows.push([a.workerName, a.date, a.reason, a.note||""]));
+  } else if (tab === "workers") {
+    rows.push(["تقرير أداء العمال"]);
+    rows.push(["الموظف", "المهنة", "أيام الحضور", "أيام الجمعة", "أيام الغياب"]);
+    const wMap={};
+    logs.forEach(log=>{
+      log.workers.forEach(w=>{
+        if(!wMap[w.workerId]) wMap[w.workerId]={name:w.workerName,prof:w.profession||"—",days:[],fri:0};
+        if(!wMap[w.workerId].days.includes(log.date)) wMap[w.workerId].days.push(log.date);
+        if(log.isFriday) wMap[w.workerId].fri++;
+      });
+    });
+    const absMap={};
+    absences.forEach(a=>{ absMap[a.workerId]=(absMap[a.workerId]||0)+1; });
+    Object.entries(wMap).sort((a,b)=>b[1].days.size-a[1].days.size).forEach(([id,w])=>{
+      rows.push([w.name, w.prof, w.days.length, w.fri, absMap[id]||0]);
+    });
+  } else if (tab === "monthly") {
+    rows.push(["التقرير الشهري"]);
+    rows.push(["الشهر", `التكاليف (${cur})`, "أيام العمل", "أيام العمال", "أيام الغياب"]);
+    const monthMap={};
+    logs.forEach(log=>{
+      const m=log.date.slice(0,7);
+      if(!monthMap[m]) monthMap[m]={cost:0,days:[],wDays:[],abs:0};
+      const counted=mkSet();
+      log.workers.forEach(w=>{
+        const key=w.workerId+"_"+log.date;
+        if(!monthMap[m].wDays.includes(key)) monthMap[m].wDays.push(key);
+        if(!counted.has(key)){
+          counted.add(key);
+          const sc=Math.max(1,mkSet(logs.filter(l=>l.date===log.date&&l.workers.some(x=>x.workerId===w.workerId)).map(l=>l.projectId)).size);
+          monthMap[m].cost+=(w.dailyWage*(log.isFriday?1.5:1))/sc;
+        }
+      });
+      if(!monthMap[m].days.includes(log.date)) monthMap[m].days.push(log.date);
+    });
+    absences.forEach(a=>{ const m=a.date.slice(0,7); if(monthMap[m]) monthMap[m].abs++; });
+    Object.entries(monthMap).sort((a,b)=>b[0].localeCompare(a[0])).forEach(([m,v])=>{
+      rows.push([m, fmtKWD(v.cost), v.days.length, v.wDays.length, v.abs]);
+    });
+  } else if (tab === "delivery") {
+    rows.push(["تقرير توقعات التسليم"]);
+    rows.push(["#", "المشروع", "المنطقة", "تاريخ التسليم", "الأيام المتبقية", "الإنجاز%"]);
+    projects.filter(p=>p.status==="نشط").sort((a,b)=>daysLeft(a.deliveryDate)-daysLeft(b.deliveryDate)).forEach(p=>{
+      const dl=daysLeft(p.deliveryDate);
+      rows.push([p.number, p.name||"—", p.region, p.deliveryDate||"—", dl<0?`تأخر ${Math.abs(dl)}`:`${dl} يوم`, overall(p)+"%"]);
+    });
+  } else if (tab === "projects") {
+    rows.push(["تقرير المشاريع التفصيلي"]);
+    rows.push(["#", "المشروع", "المنطقة", "الحالة", "الإنجاز%", "الأيام المنقضية", "مدة التسليم", `التكلفة (${cur})`, "العمال"]);
+    projects.forEach(p=>{
+      const ov=overall(p), c=projCosts(p.id,logs);
+      const endD=mkDate(), startD=mkDate(p.startDate);
+      const actualDays=countWD(p.startDate, endD.toISOString().split("T")[0]);
+      const uniq=mkSet(logs.filter(l=>l.projectId===p.id).flatMap(l=>l.workers.map(w=>w.workerId))).size;
+      rows.push([p.number, p.name||"—", p.region, p.status, ov+"%", actualDays, p.deliveryDays||0, fmtKWD(c.total), uniq]);
+    });
+  }
+  const csv = BOM + rows.map(r => r.map(cell => `"${String(cell||"").replace(/"/g,'""')}"`).join(",")).join("
+");
+  const blob = mkBlob([csv], {type:"text/csv;charset=utf-8;"});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = `تقرير_${tab}_${today()}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
+function printReport(tab) {
+  window.print();
+}
+function ReportsPage({workers, logs, absences, projects, settings: reSettings}) {
+  const [tab, setTab] = useState("overtime");
+  const [fromDate, setFromDate] = useState(() => {
+    const d = mkDate(); d.setDate(1);
+    return d.toISOString().split("T")[0];
+  });
+  const [toDate, setToDate] = useState(today());
+  const filtLogs = logs.filter(l => l.date>=fromDate && l.date<=toDate);
+  const filtAbs  = absences.filter(a => a.date>=fromDate && a.date<=toDate);
+  const overtimeMap = {};
+  filtLogs.forEach(log => {
+    if (!log.isFriday) return;
+    log.workers.forEach(w => {
+      const workerData = workers.find(x => x.id===w.workerId);
+      const currentWage = workerData ? wage(workerData.salary) : w.dailyWage;
+      if (!overtimeMap[w.workerId]) overtimeMap[w.workerId] = {name:w.workerName, prof:w.profession||"—", dailyWage:currentWage, days:[], total:0};
+      if (!overtimeMap[w.workerId].days.includes(log.date)) {
+        overtimeMap[w.workerId].days.push(log.date);
+        overtimeMap[w.workerId].total += currentWage * 1.5;
+      }
+    });
+  });
+  const overtime = Object.values(overtimeMap).sort((a,b)=>b.days.length-a.days.length);
+  const absMap = {};
+  filtAbs.forEach(a => {
+    if (!absMap[a.workerId]) absMap[a.workerId] = {name:a.workerName, entries:[]};
+    absMap[a.workerId].entries.push(a);
+  });
+  const absReport = Object.values(absMap).sort((a,b)=>b.entries.length-a.entries.length);
+  const reasonMap = {};
+  filtAbs.forEach(a => {
+    reasonMap[a.reason] = (reasonMap[a.reason]||0)+1;
+  });
+  return (
+    <div>
+ <div style={{marginBottom:14}}>
+ <h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>التقارير</h2>
+      </div>
+      {/* Date range */}
+ <div style={{...CARD,padding:12,marginBottom:14}}>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+ <div><label style={LBL}>من</label><input type="date" value={fromDate} onChange={ev=>setFromDate(ev.target.value)} style={{...INP,padding:"7px 10px"}}/></div>
+ <div><label style={LBL}>إلى</label><input type="date" value={toDate} onChange={ev=>setToDate(ev.target.value)} style={{...INP,padding:"7px 10px"}}/></div>
+        </div>
+      </div>
+      {/* Export Buttons */}
+ <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+        <button onClick={()=>exportReportCSV(tab,{projects,workers,logs,absences,filtLogs,filtAbs,overtime,absReport,settings:reSettings})}
+ style={{flex:1,padding:"9px 14px",background:"#dcfce7",border:"1px solid #86efac",borderRadius:10,fontSize:12,fontWeight:700,color:"#15803d",cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+          📥 تصدير Excel
+        </button>
+        <button onClick={()=>printReport(tab)}
+ style={{flex:1,padding:"9px 14px",background:"#dbeafe",border:"1px solid #93c5fd",borderRadius:10,fontSize:12,fontWeight:700,color:"#1d4ed8",cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+          🖨️ طباعة
+        </button>
+      </div>
+      {/* Tabs */}
+ <div style={{display:"flex",gap:6,marginBottom:14}}>
+        {[
+        {id:"overtime",  label:"⏰ عمل إضافي",    count:overtime.length},
+        {id:"absence",   label:"❌ الغياب",        count:filtAbs.length},
+        {id:"projects",  label:"📁 المشاريع",      count:0},
+        {id:"compare",   label:"📊 مقارنة",        count:0},
+        {id:"delivery",  label:"🚨 قريب التسليم",  count:0},
+        {id:"workers",   label:"👷 أداء العمال",    count:0},
+        {id:"monthly",   label:"📅 شهري",          count:0},
+      ].map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)}
+ style={{flex:1,padding:"10px 8px",borderRadius:10,border:`2px solid ${tab===t.id?"#1e40af":"#e2e8f0"}`,background:tab===t.id?"#1e40af":"white",color:tab===t.id?"white":"#64748b",fontFamily:"inherit",fontWeight:700,fontSize:13,cursor:"pointer"}}>
+            {t.label}
+ <span style={{marginRight:6,background:tab===t.id?"rgba(255,255,255,.25)":"#f1f5f9",color:tab===t.id?"white":"#64748b",borderRadius:99,padding:"1px 7px",fontSize:11}}>{t.count}</span>
+          </button>
+        ))}
+      </div>
+      {/* Overtime Tab */}
+      {tab==="overtime" && (
+        <div>
+          {overtime.length===0
+ ? <div style={{...CARD,padding:30,textAlign:"center",color:"#94a3b8"}}>لا يوجد عمل إضافي في هذه الفترة</div>
+ : <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {overtime.map((w,i) => (
+ <div key={i} style={{...CARD,padding:14}}>
+ <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+ <div style={{width:38,height:38,borderRadius:"50%",background:"#fef9c3",color:"#a16207",border:"2px solid #fde047",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:16,flexShrink:0}}>{w.name[0]}</div>
+ <div style={{flex:1}}>
+ <div style={{fontWeight:700,fontSize:14,color:"#1e293b"}}>{w.name}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{w.prof}</div>
+                      </div>
+ <div style={{textAlign:"left"}}>
+ <div style={{fontSize:13,fontWeight:800,color:"#a16207"}}>{w.days.length} جمعة</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>يومية: {fmtKWD(w.dailyWage)} د.ك</div>
+ <div style={{fontSize:12,fontWeight:700,color:"#0f766e"}}>{fmtKWD(w.total)} د.ك</div>
+                      </div>
+                    </div>
+ <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                      {w.days.map(d=><Pill key={d} label={d} bg="#fef9c3" text="#a16207" border="#fde047"/>)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+          }
+        </div>
+      )}
+      {/* Absence Tab */}
+      {tab==="absence" && (
+        <div>
+          {/* Summary by reason */}
+          {Object.keys(reasonMap).length>0 && (
+ <div style={{...CARD,padding:14,marginBottom:14}}>
+ <div style={{fontSize:13,fontWeight:700,color:"#1e293b",marginBottom:10}}>ملخص أسباب الغياب</div>
+ <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {Object.entries(reasonMap).sort((a,b)=>b[1]-a[1]).map(([r,n])=>(
+ <div key={r} style={{background:"#f8fafc",borderRadius:8,padding:"6px 12px",border:"1px solid #e2e8f0",textAlign:"center"}}>
+ <div style={{fontSize:16,fontWeight:800,color:"#1e293b"}}>{n}</div>
+ <div style={{fontSize:11,color:"#64748b"}}>{r}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {absReport.length===0
+ ? <div style={{...CARD,padding:30,textAlign:"center",color:"#94a3b8"}}>لا يوجد غياب في هذه الفترة</div>
+ : <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {absReport.map((w,i) => (
+ <div key={i} style={{...CARD,padding:14}}>
+ <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+ <div style={{width:38,height:38,borderRadius:"50%",background:"#fee2e2",color:"#b91c1c",border:"2px solid #fca5a5",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:16,flexShrink:0}}>{w.name[0]}</div>
+ <div style={{flex:1}}>
+ <div style={{fontWeight:700,fontSize:14,color:"#1e293b"}}>{w.name}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{w.entries.length} يوم غياب</div>
+                      </div>
+                      <Pill label={`${w.entries.length} يوم`} bg="#fee2e2" text="#b91c1c" border="#fca5a5"/>
+                    </div>
+ <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                      {w.entries.map((a,ai)=>(
+ <div key={ai} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"5px 8px",background:"#f8fafc",borderRadius:7}}>
+ <span style={{color:"#475569",fontWeight:600}}>{a.date}</span>
+ <span style={{color:"#b91c1c",fontWeight:700}}>{a.reason}</span>
+ {a.note && <span style={{color:"#64748b",fontStyle:"italic"}}>({a.note})</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+          }
+        </div>
+      )}
+      {/* Compare Tab */}
+      {tab==="compare" && (
+        <div>
+ <div style={{overflowX:"auto"}}>
+ <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
+              <thead>
+ <tr style={{background:"#f1f5f9"}}>
+                  {["المشروع","الإنجاز","التكلفة","الأيام المتبقية","العمال","الحالة"].map(h=>(
+ <th key={h} style={{padding:"8px 10px",textAlign:"right",fontWeight:700,color:"#475569",borderBottom:"2px solid #e2e8f0",whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {projects.map((p,pi)=>{
+                  const ov=overall(p), dl=daysLeft(p.deliveryDate);
+                  const c=projCosts(p.id,logs);
+                  const uniq=mkSet(logs.filter(l=>l.projectId===p.id).flatMap(l=>l.workers.map(w=>w.workerId))).size;
+                  const isLate=dl<=0&&p.status!=="مكتمل";
+                  const st=PS[p.status]||PS.نشط;
+                  return(
+ <tr key={p.id} style={{borderBottom:"1px solid #f1f5f9",background:pi%2===0?"white":"#fafafa"}}>
+ <td style={{padding:"10px 10px"}}>
+ <div style={{fontWeight:700,color:"#1e293b"}}>#{p.number}</div>
+ <div style={{color:"#64748b",fontSize:11}}>{p.name||p.region}</div>
+                      </td>
+ <td style={{padding:"10px 10px"}}>
+ <div style={{display:"flex",alignItems:"center",gap:6}}>
+ <div style={{flex:1,height:6,background:"#e2e8f0",borderRadius:99,overflow:"hidden",minWidth:60}}>
+ <div style={{height:"100%",background:ov>=80?"#15803d":ov>=40?"#1e40af":"#ef4444",borderRadius:99,width:`${ov}%`}}/>
+                          </div>
+ <b style={{color:"#1e293b",minWidth:32}}>{ov}%</b>
+                        </div>
+                      </td>
+ <td style={{padding:"10px 10px",fontWeight:700,color:"#0f766e"}}>{fmtKWD(c.total)}</td>
+ <td style={{padding:"10px 10px"}}>
+ <span style={{fontWeight:700,color:isLate?"#b91c1c":dl<=7?"#a16207":"#15803d"}}>
+                          {p.status==="مكتمل"?"✅":isLate?`تأخر ${Math.abs(dl)}`:`${dl} يوم`}
+                        </span>
+                      </td>
+ <td style={{padding:"10px 10px",color:"#475569"}}>{uniq} عامل</td>
+ <td style={{padding:"10px 10px"}}>
+ <span style={{...st,padding:"2px 8px",borderRadius:99,fontSize:11,fontWeight:700,border:`1px solid ${st.border}`}}>{p.status}</span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+      {/* Delivery Soon Tab */}
+      {tab==="delivery" && (()=>{
+        const soon=projects.filter(p=>p.status==="نشط"&&daysLeft(p.deliveryDate)>=0&&daysLeft(p.deliveryDate)<=7)
+          .sort((a,b)=>daysLeft(a.deliveryDate)-daysLeft(b.deliveryDate));
+        const late=projects.filter(p=>p.status==="نشط"&&daysLeft(p.deliveryDate)<0)
+          .sort((a,b)=>daysLeft(a.deliveryDate)-daysLeft(b.deliveryDate));
+        return(
+          <div>
+            {late.length>0&&(
+ <div style={{marginBottom:14}}>
+ <div style={{fontSize:13,fontWeight:700,color:"#b91c1c",marginBottom:8}}>🔴 متأخرة ({late.length})</div>
+                {late.map(p=>{
+                  const dl=daysLeft(p.deliveryDate), ov=overall(p);
+                  return(
+ <div key={p.id} style={{...CARD,padding:14,marginBottom:8,borderRight:"4px solid #ef4444"}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div>
+ <div style={{fontWeight:700,color:"#1e293b"}}>#{p.number} — {p.name||p.region}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>📅 {p.deliveryDate}</div>
+                        </div>
+ <div style={{textAlign:"left"}}>
+ <div style={{fontSize:14,fontWeight:800,color:"#b91c1c"}}>تأخر {Math.abs(dl)} يوم</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{ov}% إنجاز</div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {soon.length>0&&(
+              <div>
+ <div style={{fontSize:13,fontWeight:700,color:"#a16207",marginBottom:8}}>🟡 خلال 7 أيام ({soon.length})</div>
+                {soon.map(p=>{
+                  const dl=daysLeft(p.deliveryDate), ov=overall(p);
+                  return(
+ <div key={p.id} style={{...CARD,padding:14,marginBottom:8,borderRight:"4px solid #f97316"}}>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div>
+ <div style={{fontWeight:700,color:"#1e293b"}}>#{p.number} — {p.name||p.region}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>📅 {p.deliveryDate}</div>
+                        </div>
+ <div style={{textAlign:"left"}}>
+ <div style={{fontSize:14,fontWeight:800,color:"#a16207"}}>{dl} يوم متبقي</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{ov}% إنجاز</div>
+                        </div>
+                      </div>
+ <div style={{marginTop:8,height:6,background:"#e2e8f0",borderRadius:99,overflow:"hidden"}}>
+ <div style={{height:"100%",background:ov>=80?"#15803d":"#f97316",borderRadius:99,width:`${ov}%`}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {soon.length===0&&late.length===0&&(
+ <div style={{...CARD,padding:30,textAlign:"center",color:"#94a3b8"}}>لا توجد مشاريع مقتربة من التسليم</div>
+            )}
+          </div>
+        );
+      })()}
+      {/* Workers Performance Tab */}
+      {tab==="workers" && (()=>{
+        const wMap={};
+        logs.forEach(log=>{
+          const daySet=mkSet();
+          log.workers.forEach(w=>{
+            const key=w.workerId+"_"+log.date;
+            if(!wMap[w.workerId]) wMap[w.workerId]={name:w.workerName,prof:w.profession||"—",days:[],fri:0};
+            if(!daySet.has(key)){ daySet.add(key); if(!wMap[w.workerId].days.includes(log.date)) wMap[w.workerId].days.push(log.date); }
+            if(log.isFriday) wMap[w.workerId].fri++;
+          });
+        });
+        const absMap={};
+        absences.forEach(a=>{ absMap[a.workerId]=(absMap[a.workerId]||0)+1; });
+        const wList=Object.entries(wMap).map(([id,v])=>({
+          id, ...v, daysCount:v.days.length,
+          absCount:absMap[id]||0,
+        })).sort((a,b)=>b.daysCount-a.daysCount);
+        return(
+          <div>
+            {wList.length===0
+ ?<div style={{...CARD,padding:30,textAlign:"center",color:"#94a3b8"}}>لا توجد بيانات</div>
+ :<div style={{display:"flex",flexDirection:"column",gap:8}}>
+                {wList.map((w,i)=>(
+ <div key={w.id} style={{...CARD,padding:14,display:"flex",alignItems:"center",gap:12}}>
+ <div style={{width:32,height:32,borderRadius:"50%",background:"#1e40af",color:"white",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:14,flexShrink:0}}>{i+1}</div>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontWeight:700,fontSize:13,color:"#1e293b"}}>{w.name}</div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>{w.prof}</div>
+ <div style={{display:"flex",gap:6,marginTop:4,flexWrap:"wrap"}}>
+                        <Pill label={`✅ ${w.daysCount} يوم`} bg="#dcfce7" text="#15803d" border="#86efac"/>
+                        {w.fri>0&&<Pill label={`⏰ ${w.fri} جمعة`} bg="#fef9c3" text="#a16207" border="#fde047"/>}
+                        {w.absCount>0&&<Pill label={`❌ ${w.absCount} غياب`} bg="#fee2e2" text="#b91c1c" border="#fca5a5"/>}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            }
+          </div>
+        );
+      })()}
+      {/* Monthly Report Tab */}
+      {tab==="monthly" && (()=>{
+        const monthMap={};
+        logs.forEach(log=>{
+          const m=log.date.slice(0,7);
+          if(!monthMap[m]) monthMap[m]={month:m, cost:0, days:[], workerDays:[], absDays:0};
+          const counted=mkSet();
+          log.workers.forEach(w=>{
+            const key=w.workerId+"_"+log.date;
+            if(!monthMap[m].workerDays.includes(key)) monthMap[m].workerDays.push(key);
+            if(!counted.has(key)){
+              counted.add(key);
+              const sc=Math.max(1,mkSet(logs.filter(l=>l.date===log.date&&l.workers.some(x=>x.workerId===w.workerId)).map(l=>l.projectId)).size);
+              monthMap[m].cost+=(w.dailyWage*(log.isFriday?1.5:1))/sc;
+            }
+          });
+          if(!monthMap[m].days.includes(log.date)) monthMap[m].days.push(log.date);
+        });
+        absences.forEach(a=>{
+          const m=a.date.slice(0,7);
+          if(!monthMap[m]) monthMap[m]={month:m,cost:0,days:[],workerDays:[],absDays:0};
+          monthMap[m].absDays++;
+        });
+        const months=Object.values(monthMap).sort((a,b)=>b.month.localeCompare(a.month));
+        const monthNames={"01":"يناير","02":"فبراير","03":"مارس","04":"أبريل","05":"مايو","06":"يونيو","07":"يوليو","08":"أغسطس","09":"سبتمبر","10":"أكتوبر","11":"نوفمبر","12":"ديسمبر"};
+        return(
+          <div>
+            {months.length===0
+ ?<div style={{...CARD,padding:30,textAlign:"center",color:"#94a3b8"}}>لا توجد بيانات</div>
+ :<div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {months.map(m=>{
+                  const [yr,mn]=m.month.split("-");
+                  return(
+ <div key={m.month} style={{...CARD,padding:16}}>
+ <div style={{fontSize:15,fontWeight:800,color:"#1e293b",marginBottom:12}}>{monthNames[mn]||mn} {yr}</div>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+ <div style={{background:"#ccfbf1",borderRadius:10,padding:"10px 12px"}}>
+ <div style={{fontSize:10,color:"#0f766e",fontWeight:700}}>💰 إجمالي التكاليف</div>
+ <div style={{fontSize:16,fontWeight:800,color:"#0f766e",marginTop:2}}>{fmtKWD(m.cost)}</div>
+                        </div>
+ <div style={{background:"#dbeafe",borderRadius:10,padding:"10px 12px"}}>
+ <div style={{fontSize:10,color:"#1e40af",fontWeight:700}}>📅 أيام العمل</div>
+ <div style={{fontSize:16,fontWeight:800,color:"#1e40af",marginTop:2}}>{m.days.length} يوم</div>
+                        </div>
+ <div style={{background:"#dcfce7",borderRadius:10,padding:"10px 12px"}}>
+ <div style={{fontSize:10,color:"#15803d",fontWeight:700}}>👷 أيام العمال</div>
+ <div style={{fontSize:16,fontWeight:800,color:"#15803d",marginTop:2}}>{m.workerDays.length} يوم</div>
+                        </div>
+ <div style={{background:"#fee2e2",borderRadius:10,padding:"10px 12px"}}>
+ <div style={{fontSize:10,color:"#b91c1c",fontWeight:700}}>❌ أيام الغياب</div>
+ <div style={{fontSize:16,fontWeight:800,color:"#b91c1c",marginTop:2}}>{m.absDays} يوم</div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            }
+          </div>
+        );
+      })()}
+      {/* Projects Report Tab */}
+      {tab==="projects" && (
+        <div>
+          {projects.length===0
+ ? <div style={{...CARD,padding:30,textAlign:"center",color:"#94a3b8"}}>لا توجد مشاريع</div>
+ : <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                {projects.map(p => {
+                  const ov = overall(p);
+                  const dl = daysLeft(p.deliveryDate);
+                  const isLate = dl<=0 && p.status!=="مكتمل";
+                  const sc = schedWithOv(p.startDate, p.deliveryDays||30, p.stageOverrides||{});
+                  const startD = mkDate(p.startDate);
+                  const completedDatesArr = Object.values(p.stageCompletedDates||{});
+                  const endD = p.status==="مكتمل" && completedDatesArr.length>0
+                    ? mkDate(Math.max(...completedDatesArr.map(d=>mkDate(d))))
+                    : mkDate();
+                  const actualDays = countWD(p.startDate, endD.toISOString().split("T")[0]);
+                  const projLogs = logs.filter(l=>l.projectId===p.id);
+                  const uniqueWorkers = mkSet(projLogs.flatMap(l=>l.workers.map(w=>w.workerId))).size;
+                  const workerDays = mkSet(projLogs.flatMap(l=>l.workers.map(w=>w.workerId+"_"+l.date))).size;
+                  const delayedStages = sc.filter((s,i)=>!(p.completedStages||[]).includes(i)&&i<=(p.currentStage||0)&&stageDelay(s.endDate,false)>0);
+                  return (
+ <div key={p.id} style={{...CARD,padding:16,borderRight:`4px solid ${isLate?"#ef4444":p.status==="مكتمل"?"#86efac":"#93c5fd"}`}}>
+                      {/* Header */}
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontSize:11,color:"#94a3b8",fontWeight:700}}>#{p.number}</div>
+ <div style={{fontSize:15,fontWeight:800,color:"#1e293b"}}>{p.name||p.region}</div>
+ <div style={{fontSize:12,color:"#64748b"}}>📍{p.region}{p.client&&` · ${p.client}`}</div>
+                        </div>
+ <div style={{textAlign:"left",flexShrink:0}}>
+                          <Ring value={ov} size={52} color={ov>=80?"#15803d":ov>=40?"#1e40af":"#ef4444"}/>
+                        </div>
+                      </div>
+                      {/* Stats grid */}
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+ <div style={{background:"#f8fafc",borderRadius:8,padding:"8px 10px"}}>
+ <div style={{fontSize:10,color:"#94a3b8",fontWeight:700}}>📅 مدة التسليم</div>
+ <div style={{fontSize:13,fontWeight:700,color:"#1e293b"}}>{p.deliveryDays||0} يوم</div>
+ <div style={{fontSize:10,color:"#64748b"}}>تاريخ: {p.deliveryDate||"—"}</div>
+                        </div>
+ <div style={{background:"#f8fafc",borderRadius:8,padding:"8px 10px"}}>
+ <div style={{fontSize:10,color:"#94a3b8",fontWeight:700}}>⏱ الأيام المنقضية</div>
+ <div style={{fontSize:13,fontWeight:700,color:"#1e293b"}}>{actualDays} يوم</div>
+ <div style={{fontSize:10,color:p.status==="مكتمل"?"#15803d":"#64748b"}}>{p.status}</div>
+                        </div>
+ <div style={{background:"#f8fafc",borderRadius:8,padding:"8px 10px"}}>
+ <div style={{fontSize:10,color:"#94a3b8",fontWeight:700}}>👷 العمالة</div>
+ <div style={{fontSize:13,fontWeight:700,color:"#1e293b"}}>{uniqueWorkers} عامل</div>
+ <div style={{fontSize:10,color:"#64748b"}}>{workerDays} يوم عمل</div>
+                        </div>
+ <div style={{background:isLate?"#fee2e2":dl<=7&&p.status!=="مكتمل"?"#fef9c3":"#f8fafc",borderRadius:8,padding:"8px 10px"}}>
+ <div style={{fontSize:10,color:"#94a3b8",fontWeight:700}}>⏳ الوقت المتبقي</div>
+ <div style={{fontSize:13,fontWeight:700,color:isLate?"#b91c1c":dl<=7?"#a16207":"#15803d"}}>
+                            {p.status==="مكتمل"?"مكتمل ✅":isLate?`تأخر ${Math.abs(dl)} يوم`:`${dl} يوم`}
+                          </div>
+                        </div>
+                      </div>
+                      {/* Current stage */}
+ <div style={{background:"#eff6ff",borderRadius:8,padding:"7px 10px",marginBottom:delayedStages.length>0?8:0,display:"flex",alignItems:"center",gap:8}}>
+ <span style={{fontSize:16}}>{ICONS[p.currentStage||0]}</span>
+                        <div>
+ <div style={{fontSize:11,color:"#94a3b8"}}>المرحلة الحالية</div>
+ <div style={{fontSize:13,fontWeight:700,color:"#1e40af"}}>{STAGES[p.currentStage||0]} ({(p.currentStage||0)+1}/9)</div>
+                        </div>
+ <div style={{marginRight:"auto",height:6,flex:1,background:"#e2e8f0",borderRadius:99,overflow:"hidden"}}>
+ <div style={{height:"100%",background:"#1e40af",borderRadius:99,width:`${ov}%`}}/>
+                        </div>
+ <span style={{fontSize:12,fontWeight:700,color:"#1e40af"}}>{ov}%</span>
+                      </div>
+                      {/* Delayed stages */}
+                      {delayedStages.length>0 && (
+ <div style={{background:"#fee2e2",borderRadius:8,padding:"7px 10px",display:"flex",flexWrap:"wrap",gap:5}}>
+ <span style={{fontSize:11,color:"#b91c1c",fontWeight:700,width:"100%"}}>⚠️ مراحل متأخرة:</span>
+                          {delayedStages.map((s,si)=>(
+                            <Pill key={si} label={`${s.icon} ${s.name}`} bg="#fee2e2" text="#b91c1c" border="#fca5a5"/>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+          }
+        </div>
+      )}
+    </div>
+  );
+}
+function UsersPage({users, onSave}) {
+  const [list, setList]   = useState(users.map(u => ({...u})));
+  const [changed, setChanged] = useState(false);
+  const [delU, setDelU]   = useState(null);
+  const [nm, setNm]       = useState("");
+  const [un, setUn]       = useState("");
+  const [pw, setPw]       = useState("");
+  const [rl, setRl]       = useState("sales");
+  useEffect(() => { setList(users.map(u => ({...u}))); setChanged(false); }, [users]);
+  function upd(id, k, v) { setList(prev => prev.map(u => u.id===id ? {...u,[k]:v} : u)); setChanged(true); }
+  function addUser() {
+    if (!nm.trim() || !un.trim() || !pw.trim()) return;
+    if (list.find(u => u.username===un.trim())) { alert("اسم المستخدم موجود مسبقاً"); return; }
+    setList(prev => [...prev, {id:"u"+Date.now(), name:nm.trim(), username:un.trim(), password:pw.trim(), role:rl}]);
+    setNm(""); setUn(""); setPw(""); setRl("sales"); setChanged(true);
+  }
+  function deleteU(id) { setList(prev => prev.filter(u => u.id!==id)); setChanged(true); setDelU(null); }
+  return (
+    <div>
+ <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+ <div><h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>المستخدمون</h2><p style={{fontSize:12,color:"#94a3b8"}}>{list.length} مستخدم</p></div>
+        {changed && <Btn sm col="green" onClick={() => onSave(list)}>💾 حفظ</Btn>}
+      </div>
+      {/* Add user */}
+ <div style={{...CARD,padding:14,marginBottom:14}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b",marginBottom:12}}>➕ إضافة مستخدم</h3>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+ <div style={{gridColumn:"1/-1"}}>
+            <label style={LBL}>الاسم الكامل</label>
+            <input value={nm} onChange={ev => setNm(ev.target.value)} placeholder="مثال: خالد العتيبي" style={INP}/>
+          </div>
+          <div>
+            <label style={LBL}>اسم المستخدم</label>
+            <input value={un} onChange={ev => setUn(ev.target.value)} placeholder="مثال: khalid" style={INP}/>
+          </div>
+          <div>
+            <label style={LBL}>كلمة السر</label>
+            <input value={pw} onChange={ev => setPw(ev.target.value)} placeholder="كلمة السر" style={INP}/>
+          </div>
+ <div style={{gridColumn:"1/-1"}}>
+            <label style={LBL}>الدور والصلاحيات</label>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              {Object.entries(ROLES).map(([k,v]) => (
+                <div key={k} onClick={() => setRl(k)}
+ style={{padding:"10px 12px",borderRadius:10,cursor:"pointer",border:`2px solid ${rl===k?v.color:"#e2e8f0"}`,background:rl===k?v.bg:"#f8fafc",transition:"all .15s"}}>
+ <div style={{fontSize:18,marginBottom:4}}>{v.icon}</div>
+ <div style={{fontSize:13,fontWeight:700,color:rl===k?v.color:"#64748b"}}>{v.label}</div>
+ <div style={{fontSize:10,color:"#94a3b8",marginTop:2,lineHeight:1.4}}>
+                    {k==="admin"  ?"كل الصلاحيات":
+                     k==="factory"?"حضور + مراحل":
+                     k==="sales"  ?"متابعة المشاريع":
+                                   "التكاليف فقط"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <Btn full onClick={addUser}>إضافة المستخدم</Btn>
+      </div>
+      {/* Users list */}
+ <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {list.map(u => {
+          const r = ROLES[u.role]||ROLES.sales;
+          return (
+ <div key={u.id} style={{...CARD,padding:14,border:`1.5px solid ${r.bg}`}}>
+ <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+ <div style={{width:40,height:40,borderRadius:"50%",background:r.bg,color:r.color,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{r.icon}</div>
+ <div style={{flex:1,minWidth:0}}>
+ <div style={{fontWeight:700,fontSize:14,color:"#1e293b"}}>{u.name}</div>
+ <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:3}}>
+                    <Pill label={r.label} bg={r.bg} text={r.color} border={r.bg}/>
+ <span style={{fontSize:11,color:"#94a3b8",fontFamily:"monospace"}}>@{u.username}</span>
+                  </div>
+                </div>
+ <button onClick={() => setDelU(u)} style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"6px 10px",fontSize:12,fontWeight:700,color:"#b91c1c",cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>🗑</button>
+              </div>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                <div>
+                  <label style={LBL}>الاسم</label>
+ <input value={u.name} onChange={ev => upd(u.id,"name",ev.target.value)} style={{...INP,padding:"6px 8px",fontSize:13}}/>
+                </div>
+                <div>
+                  <label style={LBL}>اسم المستخدم</label>
+ <input value={u.username} onChange={ev => upd(u.id,"username",ev.target.value)} style={{...INP,padding:"6px 8px",fontSize:13}}/>
+                </div>
+                <div>
+                  <label style={LBL}>كلمة السر</label>
+ <input value={u.password} onChange={ev => upd(u.id,"password",ev.target.value)} style={{...INP,padding:"6px 8px",fontSize:13}}/>
+                </div>
+ <div style={{gridColumn:"1/-1"}}>
+                  <label style={LBL}>الدور</label>
+ <select value={u.role} onChange={ev => upd(u.id,"role",ev.target.value)} style={{...INP,padding:"6px 10px",fontSize:13}}>
+                    {Object.entries(ROLES).map(([k,v]) => <option key={k} value={k}>{v.icon} {v.label}</option>)}
+                  </select>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+ {list.length===0 && <div style={{textAlign:"center",color:"#94a3b8",padding:40}}>لا يوجد مستخدمون</div>}
+      </div>
+      {delU && (
+        <Confirm icon="🗑" title={`حذف ${delU.name}؟`}
+          body="سيتم حذف هذا المستخدم نهائياً ولن يتمكن من الدخول."
+          okLabel="نعم، احذف" okCol="red"
+          onOk={() => deleteU(delU.id)}
+          onCancel={() => setDelU(null)}/>
+      )}
+    </div>
+  );
+}
+function SettingsPage({settings, onSave}) {
+  const [f, setF] = useState({...settings});
+  const logoRef   = useRef();
+  function setField(k, v) { setF(prev => ({...prev,[k]:v})); }
+  function handleLogo(ev) {
+    const file = ev.target.files[0]; if (!file) return;
+    const reader = mkReader();
+    reader.onload = rv => setField("logo", rv.target.result);
+    reader.readAsDataURL(file);
+  }
+  return (
+    <div>
+ <div style={{marginBottom:14}}><h2 style={{fontSize:20,fontWeight:800,color:"#1e293b"}}>الإعدادات</h2></div>
+ <div style={{display:"flex",flexDirection:"column",gap:12}}>
+ <div style={{...CARD,padding:16}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b",marginBottom:14}}>🏭 معلومات الشركة</h3>
+ <div style={{textAlign:"center",marginBottom:14}}>
+            {f.logo
+ ? <img src={f.logo} alt="" style={{width:80,height:80,borderRadius:16,objectFit:"contain",border:"2px solid #e2e8f0",display:"block",margin:"0 auto 8px"}}/>
+ : <div style={{width:80,height:80,borderRadius:16,background:"#f1f5f9",display:"flex",alignItems:"center",justifyContent:"center",fontSize:40,margin:"0 auto 8px",border:"2px dashed #e2e8f0"}}>{f.emoji}</div>
+            }
+ <input ref={logoRef} type="file" accept="image/*" style={{display:"none"}} onChange={handleLogo}/>
+ <div style={{display:"flex",gap:8,justifyContent:"center"}}>
+              <Btn sm col="ghost" onClick={() => logoRef.current.click()}>📤 رفع لوجو</Btn>
+              {f.logo && <Btn sm col="ghost" onClick={() => setField("logo",null)}>🗑 حذف</Btn>}
+            </div>
+          </div>
+ <div style={{display:"grid",gridTemplateColumns:"1fr 70px",gap:10,marginBottom:10}}>
+            <div>
+              <label style={LBL}>اسم الشركة</label>
+              <input value={f.name} onChange={ev => setField("name",ev.target.value)} style={INP}/>
+            </div>
+            <div>
+              <label style={LBL}>Emoji</label>
+ <input value={f.emoji} onChange={ev => setField("emoji",ev.target.value)} style={{...INP,fontSize:22,textAlign:"center"}}/>
+            </div>
+          </div>
+          <div>
+            <label style={LBL}>العملة</label>
+            <select value={f.cur} onChange={ev => setField("cur",ev.target.value)} style={INP}>
+              {["د.ك","ر.س","د.إ","دولار"].map(c => <option key={c}>{c}</option>)}
+            </select>
+          </div>
+        </div>
+ <div style={{...CARD,padding:16}}>
+ <h3 style={{fontSize:13,fontWeight:700,color:"#1e293b",marginBottom:12}}>🎨 اللون الرئيسي</h3>
+ <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+            {["#1e40af","#15803d","#b91c1c","#a16207","#7e22ce","#0f766e","#c2410c","#1e293b"].map(c => (
+ <div key={c} onClick={() => setField("color",c)} style={{width:40,height:40,borderRadius:"50%",background:c,cursor:"pointer",border:f.color===c?"4px solid #1e293b":"4px solid transparent",transition:"transform .15s",transform:f.color===c?"scale(1.15)":"scale(1)"}}/>
+            ))}
+          </div>
+        </div>
+ <div style={{...CARD,padding:14,background:"#f0fdf4",border:"1px solid #86efac"}}>
+ <div style={{display:"flex",alignItems:"center",gap:10}}>
+ <span style={{fontSize:24}}>👥</span>
+            <div>
+ <div style={{fontSize:13,fontWeight:700,color:"#15803d"}}>إدارة المستخدمين والصلاحيات</div>
+ <div style={{fontSize:11,color:"#64748b"}}>اذهب لصفحة "المستخدمون" من القائمة السفلية</div>
+            </div>
+          </div>
+        </div>
+        <Btn full onClick={() => onSave(f)}>💾 حفظ الإعدادات</Btn>
+      </div>
+    </div>
+  );
+}
+const NAVS = [
+  {id:"home",     icon:"🏠", label:"الرئيسية",  perm:"viewProjects"},
+  {id:"projects", icon:"📁", label:"المشاريع",   perm:"viewProjects"},
+  {id:"workers",  icon:"👷", label:"الموظفون",   perm:"viewWorkers"},
+  {id:"absence",  icon:"📋", label:"الغياب",     perm:"logAbsence"},
+  {id:"costs",    icon:"💰", label:"التكاليف",   perm:"viewCosts"},
+  {id:"reports",  icon:"📊", label:"التقارير",   perm:"viewReports"},
+  {id:"users",    icon:"👥", label:"المستخدمون", perm:"viewSettings"},
+  {id:"settings", icon:"⚙️", label:"الإعدادات",  perm:"viewSettings"},
+];
+function App() {
+  function load(k, d) { try { const s=localStorage.getItem(k); return s?JSON.parse(s):d; } catch { return d; } }
+  const [projects,  setProjects]  = useState(() => load("pj_v14",[]));
+  const [workers,   setWorkers]   = useState(() => load("wk_v7", DEF_WORKERS));
+  const [logs,      setLogs]      = useState(() => load("lg_v7", []));
+  const [absences,  setAbsences]  = useState(() => load("ab_v1", []));
+  const [settings,  setSettings]  = useState(() => load("st_v5", DEF_SETTINGS));
+  const [users,     setUsers]     = useState(() => load("us_v3", DEF_USERS));
+  const [session,   setSession]   = useState(() => load("ss_v2", null));
+  const [page,      setPage]      = useState("home");
+  const [detailId,  setDetailId]  = useState(null);
+  const [logProj,   setLogProj]   = useState(null);
+  const [projForm,  setProjForm]  = useState(null);
+  const [delCf,     setDelCf]     = useState(null);
+  const [toast,     setToast]     = useState(null);
+  useEffect(() => { localStorage.setItem("pj_v14", JSON.stringify(projects));  }, [projects]);
+  useEffect(() => { localStorage.setItem("wk_v7",  JSON.stringify(workers));   }, [workers]);
+  useEffect(() => { localStorage.setItem("lg_v7",  JSON.stringify(logs));      }, [logs]);
+  useEffect(() => { localStorage.setItem("ab_v1",  JSON.stringify(absences));  }, [absences]);
+  useEffect(() => { localStorage.setItem("st_v5",  JSON.stringify(settings));  }, [settings]);
+  useEffect(() => { localStorage.setItem("us_v3",  JSON.stringify(users));     }, [users]);
+  useEffect(() => { localStorage.setItem("ss_v2",  JSON.stringify(session));   }, [session]);
+  const role     = session?.role || "sales";
+  const curProj  = projects.find(p => p.id===detailId);
+  const visNavs  = NAVS.filter(n => can(role,n.perm));
+  const saveProject = useCallback(p => {
+    setProjects(prev => prev.find(x => x.id===p.id) ? prev.map(x => x.id===p.id?p:x) : [...prev,p]);
+    setProjForm(null); setToast("✅ تم حفظ المشروع");
+  }, []);
+  const deleteProject = useCallback((id, number) => {
+    setDelCf({
+      title: `سيتم حذف المشروع رقم ${number} وجميع سجلات الحضور نهائياً.`,
+      onOk: () => {
+        setProjects(prev => prev.filter(p => p.id!==id));
+        setLogs(prev => prev.filter(l => l.projectId!==id));
+        if (detailId===id) { setDetailId(null); setPage("projects"); }
+        setDelCf(null); setToast("🗑 تم حذف المشروع");
+      }
+    });
+  }, [detailId]);
+  const saveLog = useCallback(entry => {
+    setLogs(prev => [
+      ...prev.filter(l => !(l.projectId===entry.projectId && l.date===entry.date && l.stageIdx===entry.stageIdx)),
+      entry
+    ].sort((a,b) => b.date.localeCompare(a.date)));
+    setLogProj(null); setToast(`✅ حضور ${entry.workers.length} عامل — ${STAGES[entry.stageIdx]||""}`);
+  }, []);
+  function viewProj(id) { setDetailId(id); setPage("detail"); }
+  if (!session) return (
+    <>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
+      <Login users={users} settings={settings} onLogin={u => setSession(u)}/>
+    </>
+  );
+  return (
+ <div dir="rtl" style={{minHeight:"100vh",background:"#f1f5f9",fontFamily:"'Cairo','Tajawal',sans-serif",paddingBottom:74}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:3px;height:3px}
+        ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:99px}
+        @keyframes glow{0%,100%{box-shadow:0 0 0 3px rgba(30,64,175,.12)}50%{box-shadow:0 0 0 7px rgba(30,64,175,.2)}}
+        input[type=range]{-webkit-appearance:none;height:4px;border-radius:99px;background:#e2e8f0}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:${settings.color};cursor:pointer}
+        @media print{
+          body{direction:rtl!important;font-family:'Cairo',sans-serif!important;}
+          nav,button,[role=navigation]{display:none!important;}
+          div[style*="position:fixed"]{display:none!important;}
+          div[style*="paddingBottom:74"]{padding-bottom:0!important;}
+          .no-print{display:none!important;}
+        }
+      `}</style>
+      {/* Top Bar */}
+ <div style={{background:settings.color,color:"white",padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100,boxShadow:"0 2px 12px rgba(0,0,0,.15)"}}>
+ <div style={{display:"flex",alignItems:"center",gap:10}}>
+          {page==="detail" && (
+ <button onClick={() => { setPage("projects"); setDetailId(null); }} style={{background:"rgba(255,255,255,.15)",border:"none",borderRadius:8,padding:"6px 10px",color:"white",fontWeight:700,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>←</button>
+          )}
+          {settings.logo
+ ? <img src={settings.logo} alt="" style={{width:32,height:32,borderRadius:8,objectFit:"contain",background:"white"}}/>
+ : <span style={{fontSize:22}}>{settings.emoji}</span>
+          }
+          <div>
+ <div style={{fontSize:14,fontWeight:800,lineHeight:1.1}}>{settings.name}</div>
+ <div style={{fontSize:10,opacity:.8}}>{ROLES[role]?.icon} {session.name}</div>
+          </div>
+        </div>
+ <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {can(role,"addProject") && (
+ <button onClick={() => setProjForm("new")} style={{background:"rgba(255,255,255,.2)",border:"none",borderRadius:8,padding:"7px 12px",color:"white",fontWeight:700,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>+ مشروع</button>
+          )}
+ <button onClick={() => { setSession(null); setPage("home"); setDetailId(null); }} style={{background:"rgba(255,255,255,.15)",border:"none",borderRadius:8,padding:"7px 10px",color:"white",fontWeight:700,cursor:"pointer",fontFamily:"inherit",fontSize:12}}>خروج</button>
+        </div>
+      </div>
+      {/* Content */}
+ <div style={{padding:"16px 14px",maxWidth:680,margin:"0 auto"}}>
+        {page==="home"     && <HomePage     projects={projects} workers={workers} logs={logs} settings={settings} role={role} onNav={setPage} onView={viewProj}/>}
+        {page==="projects" && <ProjectsPage projects={projects} logs={logs} role={role} onAdd={() => setProjForm("new")} onEdit={p => setProjForm(p)} onDelete={deleteProject} onView={viewProj} onLog={p => setLogProj(p)}/>}
+        {page==="detail"   && curProj && <ProjectDetail project={curProj} logs={logs} role={role} onBack={() => { setPage("projects"); setDetailId(null); }} onEdit={p => setProjForm(p)} onDelete={deleteProject} onLog={p => setLogProj(p)} setProjects={setProjects} setToast={setToast}/>}
+        {page==="workers"  && can(role,"viewWorkers")  && <WorkersPage  workers={workers} logs={logs} onSave={w => { setWorkers(w); setToast("✅ تم حفظ بيانات الموظفين"); }}/>}
+        {page==="absence"  && can(role,"logAbsence")   && <AbsencePage  workers={workers} absences={absences} onSave={(date,newAbs) => {
+          setAbsences(prev => [...prev.filter(a => a.date!==date), ...newAbs]);
+          setToast(`✅ تم حفظ غياب ${newAbs.length} موظف`);
+        }}/>}
+        {page==="costs"    && can(role,"viewCosts")    && <CostsPage    projects={projects} workers={workers} logs={logs} settings={settings} role={role} onLog={p => setLogProj(p)} onExport={p => exportCSV(p,logs,settings.cur)}/>}
+        {page==="reports"  && can(role,"viewReports")  && <ReportsPage  workers={workers} logs={logs} absences={absences} projects={projects} settings={settings}/>}
+        {page==="users"    && can(role,"viewSettings") && <UsersPage    users={users} onSave={u => { setUsers(u); setToast("✅ تم حفظ المستخدمين"); }}/>}
+        {page==="settings" && can(role,"viewSettings") && <SettingsPage settings={settings} onSave={s => { setSettings(s); setToast("✅ تم حفظ الإعدادات"); }}/>}
+      </div>
+      {/* Bottom Nav */}
+ <div style={{position:"fixed",bottom:0,right:0,left:0,background:"white",borderTop:"1px solid #e2e8f0",display:"flex",zIndex:100,boxShadow:"0 -2px 12px rgba(0,0,0,.06)"}}>
+        {visNavs.map(n => {
+          const active = (page===n.id) || (n.id==="projects" && page==="detail");
+          return (
+            <button key={n.id} onClick={() => { setPage(n.id); if (n.id!=="projects") setDetailId(null); }}
+ style={{flex:1,padding:"10px 4px 8px",border:"none",background:"transparent",cursor:"pointer",fontFamily:"inherit",display:"flex",flexDirection:"column",alignItems:"center",gap:2,borderTop:`2px solid ${active?settings.color:"transparent"}`,transition:"all .15s"}}>
+ <span style={{fontSize:20}}>{n.icon}</span>
+ <span style={{fontSize:10,fontWeight:active?700:500,color:active?settings.color:"#94a3b8"}}>{n.label}</span>
+            </button>
+          );
+        })}
+      </div>
+      {/* Modals */}
+      {projForm  && <ProjForm project={projForm==="new"?null:projForm} role={role} onSave={saveProject} onClose={() => setProjForm(null)}/>}
+      {logProj   && <LogForm  project={logProj} workers={workers} logs={logs} currentStage={logProj.currentStage||0} role={role} onSave={saveLog} onClose={() => setLogProj(null)}/>}
+      {delCf     && <Confirm  icon="🗑" title="تأكيد الحذف" body={delCf.title} okLabel="نعم، احذف" okCol="red" onOk={delCf.onOk} onCancel={() => setDelCf(null)}/>}
+      {toast     && <Toast    msg={toast} onDone={() => setToast(null)}/>}
+    </div>
+  );
+}
+const container = document.getElementById('root');
+const root = ReactDOM.createRoot(container);
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
